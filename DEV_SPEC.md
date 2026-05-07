@@ -10,7 +10,101 @@
 
 项目目标不是做一个一次性 Demo，而是形成一套可讲解、可扩展、可测试、可持续迭代的工程骨架，既可作为求职项目，也可作为教学与面试拆解素材。
 
-## 2. 设计原则
+## 2. 核心特色与系统亮点
+本节用于在文档前部先回答“这个项目最值得讲的是什么”。后续章节再分别展开实现细节、架构取舍与工程落地问题。
+
+### 2.1 RAG 策略与设计
+1. 本项目不是简单的“向量检索 + LLM 回答”，而是完整的工程化 RAG 链路，包括 Ingestion、Hybrid Retrieval、RRF 融合、Rerank、Context Build、Evaluation。
+2. RAG 的重点不是单个算法，而是把文档处理、检索召回、重排过滤、上下文构建和回答生成串成稳定闭环。
+3. 设计亮点在于把每个阶段都显式拆开，使系统既能调优，也能讲清楚。
+
+设计思想与优势：
+1. 通过 Hybrid Retrieval 兼顾关键词精确匹配和语义召回。
+2. 通过 Rerank 将“能召回”提升为“能用于回答”。
+3. 通过 Context Builder 将 metadata、图片描述、memory 统一纳入最终 prompt 组装。
+
+工程化难点：
+1. 文档解析噪声会直接传导到检索效果。
+2. 检索命中不等于生成正确，Context Build 仍是关键。
+3. 每个阶段都需要可观测和可评估，否则难以落地优化。
+
+### 2.2 全链路可插拔架构
+1. LLM、Embedding、Reranker、VectorStore、Splitter、Evaluator、MemoryStore、Tool 都必须支持抽象与替换。
+2. 所有组件替换通过配置驱动完成，而不是在业务逻辑中写 provider 分支。
+3. 这使项目具备长期演进能力，而不是绑定单一技术栈的短期 Demo。
+
+设计思想与优势：
+1. 抽象接口保证系统边界清晰。
+2. 工厂模式保证 provider 切换成本低。
+3. 配置驱动保证实验、教学、部署时的可控性。
+
+工程化难点：
+1. 抽象做得太薄会失去可替换价值，做得太厚会导致接口失真。
+2. 不同 provider 的能力边界不同，需要统一最小公共契约。
+3. 插拔能力必须和测试体系配套，否则切换后容易失控。
+
+### 2.3 MCP 生态集成
+1. 本项目将内部能力封装为 MCP Tools，而不是只做一个本地脚本或传统 HTTP 服务。
+2. 通过 MCP，可以直接接入 Copilot、Claude Desktop 等客户端，体现更强的 AI 工程集成能力。
+3. `stdio transport` 让系统以本地子进程形式运行，降低部署复杂度并贴合编辑器集成场景。
+
+设计思想与优势：
+1. 一次开发，多客户端复用。
+2. 能直接融入 AI 助手工作流，而不是额外再造一个前端。
+3. 更适合作为教学和求职项目展示“协议层集成能力”。
+
+工程化难点：
+1. tool 边界必须清晰，过大过小都不利于实际使用。
+2. 输入输出 schema 必须稳定，否则客户端适配成本高。
+3. tool 错误必须可恢复、可追踪。
+
+### 2.4 多模态、可观测性、可视化管理与评估体系
+1. 多模态上，本项目采用 Vision LLM Captioning，而不是引入复杂的图像向量检索体系。
+2. 可观测性上，要求 Ingestion Trace、Query Trace、Agent Trace 全链路留痕。
+3. 管理上，通过 Streamlit Dashboard 展示系统总览、数据浏览、摄取状态、Trace 与评估结果。
+4. 评估上，通过 Ragas 与自定义指标形成回归闭环。
+
+设计思想与优势：
+1. 多模态策略强调“低复杂度集成进现有文本 RAG 链路”。
+2. 可观测性让系统从黑盒变为白盒。
+3. Dashboard 与评估体系让优化从主观感受转为数据驱动。
+
+工程化难点：
+1. 图片描述注入位置会影响检索质量。
+2. 没有 Trace 很难定位问题阶段。
+3. 没有评估基线就无法做持续优化与回归校验。
+
+### 2.5 可扩展性与未来演进
+1. 本项目首版聚焦单机、本地优先，但必须预留生产化迁移路径。
+2. 当前架构要支持后续扩展到新向量库、新模型、新评估器、新加载器。
+3. 在能力上要支持从 RAG 扩展到 Agentic RAG、Memory、Multi-Agent。
+
+设计思想与优势：
+1. 首版先做最小闭环，但不阻断后续演进。
+2. 将系统拆成多个稳定模块，便于局部替换。
+3. 为教学和面试提供自然的“从 v1 到 v2”的演进叙事。
+
+工程化难点：
+1. 需要避免为了未来扩展而过度设计。
+2. 需要在局部简单和整体演进之间保持平衡。
+3. 扩展点必须真实可落地，而不是只停留在概念预留。
+
+### 2.6 Agent Loop 与智能体扩展
+1. 本项目不把 Agent 作为独立附属物，而是作为 RAG 之上的自然扩展层。
+2. 首版提供最小 Thought → Action → Observation 闭环。
+3. 后续扩展到 Planner、Executor、Retriever、Evaluator 等多角色协作。
+
+设计思想与优势：
+1. 先做最小可解释闭环，保证能调试、能讲清。
+2. Tool System 与 Memory System 复用同一底层架构，避免体系分裂。
+3. Agent Trace 为后续 trajectory 评估与故障分析奠定基础。
+
+工程化难点：
+1. 工具调度、状态管理、循环终止条件都容易出问题。
+2. Agent 失败不只是模型问题，常常是系统设计问题。
+3. 若没有统一 Tool 抽象和 Trace，很难真正扩展到 Multi-Agent。
+
+## 3. 设计原则
 1. 本地优先：默认本地运行、本地存储、本地调试，核心持久化使用 SQLite，本地向量库存储优先使用 Chroma。
 2. 强约束分层：严格区分 `application / domain / infrastructure / interface / observability / evaluation / agent`，禁止跨层直接耦合。
 3. 可插拔优先：LLM、Embedding、Reranker、VectorStore、Splitter、Evaluator、MemoryStore 必须全部抽象化。
@@ -20,13 +114,13 @@
 7. 测试先行：核心领域逻辑优先 TDD，所有回归问题必须附带测试。
 8. 不引入重框架：禁止使用 LangChain、LlamaIndex 做编排，仅允许 `RecursiveCharacterTextSplitter`。
 
-## 3. 非目标
+## 4. 非目标
 1. 不提供 HTTP 服务。
 2. 不做在线多租户 SaaS。
 3. 首版不实现完整 Multi-Agent，只提供接口与预留架构。
 4. 首版不做分布式部署，不做复杂权限系统。
 
-## 4. 总体架构
+## 5. 总体架构
 ```text
 +------------------- MCP Client -------------------+
 | Copilot / Claude Desktop / Local Agent Runtime   |
@@ -59,7 +153,7 @@
 +-------------------------------------------------------+
 ```
 
-## 5. 目录结构
+## 6. 目录结构
 ```text
 project/
 ├── README.md
@@ -150,7 +244,7 @@ project/
     └── traces/
 ```
 
-## 6. 模块职责表
+## 7. 模块职责表
 | 模块 | 职责 | 不负责 |
 |---|---|---|
 | `mcp_server` | MCP tools 注册、输入输出校验、调用应用服务 | 不写业务逻辑 |
@@ -163,8 +257,8 @@ project/
 | `evaluation` | 跑评估、产出指标 | 不处理查询主链路 |
 | `agent` | Thought-Action-Observation 编排、工具调度、记忆读写 | 不绑定具体工具实现 |
 
-## 7. 核心领域模型
-### 7.1 Document
+## 8. 核心领域模型
+### 8.1 Document
 ```python
 from pydantic import BaseModel
 from typing import Any
@@ -179,7 +273,7 @@ class Document(BaseModel):
     metadata: dict[str, Any]
 ```
 
-### 7.2 Chunk
+### 8.2 Chunk
 ```python
 from pydantic import BaseModel, Field
 from typing import Any
@@ -201,7 +295,7 @@ class Chunk(BaseModel):
     content_hash: str
 ```
 
-### 7.3 QueryContext
+### 8.3 QueryContext
 ```python
 class QueryRequest(BaseModel):
     query: str
@@ -228,8 +322,8 @@ class QueryResponse(BaseModel):
     trace_id: str
 ```
 
-## 8. 可插拔抽象接口
-### 8.1 LLM
+## 9. 可插拔抽象接口
+### 9.1 LLM
 ```python
 from abc import ABC, abstractmethod
 
@@ -245,7 +339,7 @@ class BaseLLM(ABC):
     def vision_caption(self, image_bytes: bytes, prompt: str) -> str: ...
 ```
 
-### 8.2 Embedding
+### 9.2 Embedding
 ```python
 class BaseEmbedding(ABC):
     @abstractmethod
@@ -255,14 +349,14 @@ class BaseEmbedding(ABC):
     def embed_query(self, text: str) -> list[float]: ...
 ```
 
-### 8.3 Reranker
+### 9.3 Reranker
 ```python
 class BaseReranker(ABC):
     @abstractmethod
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]: ...
 ```
 
-### 8.4 VectorStore
+### 9.4 VectorStore
 ```python
 class BaseVectorStore(ABC):
     @abstractmethod
@@ -278,21 +372,21 @@ class BaseVectorStore(ABC):
     def list_collections(self) -> list[str]: ...
 ```
 
-### 8.5 Splitter
+### 9.5 Splitter
 ```python
 class BaseSplitter(ABC):
     @abstractmethod
     def split_markdown(self, doc: Document) -> list[Chunk]: ...
 ```
 
-### 8.6 Evaluator
+### 9.6 Evaluator
 ```python
 class BaseEvaluator(ABC):
     @abstractmethod
     def evaluate(self, dataset_path: str, run_id: str) -> dict: ...
 ```
 
-### 8.7 Tool
+### 9.7 Tool
 ```python
 class BaseTool(ABC):
     name: str
@@ -305,7 +399,7 @@ class BaseTool(ABC):
     def run(self, payload: dict) -> dict: ...
 ```
 
-### 8.8 MemoryStore
+### 9.8 MemoryStore
 ```python
 class BaseMemoryStore(ABC):
     @abstractmethod
@@ -318,7 +412,7 @@ class BaseMemoryStore(ABC):
     def summarize_memory(self, conversation_id: str) -> dict: ...
 ```
 
-## 9. Provider Factory
+## 10. Provider Factory
 ```python
 class ProviderFactory:
     def __init__(self, settings):
@@ -338,8 +432,8 @@ class ProviderFactory:
 2. 服务层只能依赖抽象接口。
 3. 工厂选择 provider 的唯一依据是 `settings.yaml`。
 
-## 10. 配置设计
-### 10.1 settings.yaml
+## 11. 配置设计
+### 11.1 settings.yaml
 ```yaml
 project:
   name: modular-rag-mcp-server
@@ -406,17 +500,17 @@ mcp:
     - get_document_summary
 ```
 
-### 10.2 Settings 规则
+### 11.2 Settings 规则
 1. 所有敏感项只能从环境变量读取。
 2. `settings.yaml` 只保存结构和默认值。
 3. 配置加载顺序：默认值 < `settings.yaml` < `.env` < 环境变量。
 4. 启动时必须做配置完整性校验，缺关键字段直接失败。
 
-## 11. Ingestion Pipeline
-### 11.1 流程
+## 12. Ingestion Pipeline
+### 12.1 流程
 `PDF -> Markdown -> Split -> LLM Enrich -> Dual Embedding -> Upsert -> Trace -> Incremental Record`
 
-### 11.2 详细步骤
+### 12.2 详细步骤
 1. 文件发现：读取待导入 PDF。
 2. 哈希计算：对原始文件计算 `SHA256`。
 3. 增量跳过：查询 `ingestion_history`，若哈希已成功处理则直接跳过。
@@ -435,7 +529,7 @@ mcp:
 11. BM25 建索引：将 `sparse_text` 写入本地 BM25 索引。
 12. 记录 Trace、日志与 ingestion_history。
 
-### 11.3 Ingestion I/O
+### 12.3 Ingestion I/O
 ```python
 class IngestionResult(BaseModel):
     doc_id: str
@@ -445,7 +539,7 @@ class IngestionResult(BaseModel):
     trace_id: str
 ```
 
-### 11.4 ingestion_history 表
+### 12.4 ingestion_history 表
 ```sql
 CREATE TABLE ingestion_history (
   file_hash TEXT PRIMARY KEY,
@@ -458,14 +552,14 @@ CREATE TABLE ingestion_history (
 );
 ```
 
-### 11.5 设计说明
+### 12.5 设计说明
 这样设计的原因是把“是否需要重跑”前置到最便宜的阶段，避免重复调用 MarkItDown、Vision LLM、Embedding。面试时可强调“零成本增量更新”和“幂等摄取”。
 
-## 12. Retrieval Pipeline
-### 12.1 查询主链路
+## 13. Retrieval Pipeline
+### 13.1 查询主链路
 `Query Normalize -> Memory Recall -> Dense Retrieve -> BM25 Retrieve -> RRF Fusion -> Rerank -> Context Build -> Answer Generate`
 
-### 12.2 详细步骤
+### 13.2 详细步骤
 1. 查询标准化：去空白、统一大小写、保留原始 query。
 2. Memory 检索：若有 `conversation_id/user_id`，先召回短期摘要和长期记忆。
 3. Dense 检索：向量检索获取 `top_k_retrieval`。
@@ -480,7 +574,7 @@ CREATE TABLE ingestion_history (
 10. 输出引用：返回 chunk 来源、页码、文档名。
 11. 写入 Query Trace 与会话短期记忆。
 
-### 12.3 RRF
+### 13.3 RRF
 ```python
 def rrf_fuse(rank_lists: list[list[str]], k: int = 60) -> dict[str, float]:
     scores = {}
@@ -490,15 +584,15 @@ def rrf_fuse(rank_lists: list[list[str]], k: int = 60) -> dict[str, float]:
     return scores
 ```
 
-### 12.4 精排策略
+### 13.4 精排策略
 1. Cross-Encoder 适合作为默认精排，成本更稳定。
 2. LLM Rerank 仅用于高价值查询或实验开关。
 3. 重排输入必须包含 `query + chunk dense_text`，不得只看裸文本。
 
-### 12.5 设计说明
+### 13.5 设计说明
 Hybrid Retrieval 解决关键词匹配与语义召回互补问题，RRF 保证融合算法简单可解释，Rerank 负责把候选集合提升到可生成答案的精度。
 
-## 13. Context 构建策略
+## 14. Context 构建策略
 上下文由四部分组成：
 
 1. 检索片段正文。
@@ -525,27 +619,27 @@ Image Notes: {image_captions}
 2. 图像描述默认和所属 chunk 同级拼接，不单独建独立回答上下文。
 3. 超长上下文必须按分数截断，禁止无上限堆叠。
 
-## 14. 多模态处理
-### 14.1 处理策略
+## 15. 多模态处理
+### 15.1 处理策略
 1. 不使用 CLIP。
 2. 只做 `Image -> Vision LLM -> Text Caption`。
 3. 将 caption 注入 `dense_text` 和 `image_captions` 字段。
 
-### 14.2 融合方式
+### 15.2 融合方式
 1. 若图片属于某段落区域，则并入对应 chunk。
 2. 若图片跨多个段落，则并入最邻近标题块。
 3. 若图片无法定位，则生成独立辅助 chunk，并标记 `metadata["synthetic_image_chunk"]=True`。
 
-### 14.3 设计说明
+### 15.3 设计说明
 该方案牺牲了图像向量检索的细粒度能力，但大幅降低系统复杂度，且与纯文本 RAG 管线兼容，适合教学和求职项目。
 
-## 15. Memory System
-### 15.1 三层结构
+## 16. Memory System
+### 16.1 三层结构
 1. Short-term memory：当前会话最近 N 轮消息和摘要。
 2. Long-term memory：用户偏好、稳定事实、历史有用知识，向量化存储。
 3. Episodic memory：一次任务的目标、步骤、结果、反思。
 
-### 15.2 数据结构
+### 16.2 数据结构
 ```python
 class MemoryRecord(BaseModel):
     memory_id: str
@@ -559,28 +653,28 @@ class MemoryRecord(BaseModel):
     created_at: str
 ```
 
-### 15.3 存储设计
+### 16.3 存储设计
 1. SQLite：存原始内容、摘要、类型、用户、时间、重要度。
 2. Chroma：仅对长期记忆和 episodic summary 存向量。
 3. 短期记忆默认仅存 SQLite。
 
-### 15.4 检索策略
+### 16.4 检索策略
 1. 短期记忆：按会话 ID 和时间窗口直接取最近 N 条。
 2. 长期记忆：按 query embedding + user_id filter 检索。
 3. Episodic memory：优先按任务标签过滤，再做向量检索。
 
-### 15.5 更新策略
+### 16.5 更新策略
 1. 每轮对话落短期记忆。
 2. 达到 `summary_trigger_turns` 时自动摘要压缩。
 3. 高重要信息由 LLM 分类后提升为长期记忆。
 4. 任务结束时生成 episodic summary。
 5. 定期运行记忆压缩任务，合并语义重复记忆。
 
-### 15.6 面试点
+### 16.6 面试点
 可以强调“短期-长期-事件”分层让系统同时兼顾实时上下文、稳定偏好和任务复盘，且通过 SQLite + Chroma 保持实现简单。
 
-## 16. Tool System
-### 16.1 Tool Registry
+## 17. Tool System
+### 17.1 Tool Registry
 ```python
 class ToolRegistry:
     def __init__(self):
@@ -596,19 +690,19 @@ class ToolRegistry:
         return [{"name": t.name, "description": t.description, "schema": t.schema()} for t in self._tools.values()]
 ```
 
-### 16.2 调度逻辑
+### 17.2 调度逻辑
 1. MCP tools 和本地 tools 都注册到统一 Registry。
 2. Agent 只依赖 Registry，不关心工具来自 MCP 还是本地函数。
 3. 每次调用必须记录 `tool_name / input / output / latency / status`。
 
-### 16.3 设计说明
+### 17.3 设计说明
 统一 Tool System 能避免后续 Agent 和 MCP 两套调用体系分裂。
 
-## 17. Agent Framework
-### 17.1 最小循环
+## 18. Agent Framework
+### 18.1 最小循环
 `Thought -> Action -> Observation -> Thought ... -> Final Answer`
 
-### 17.2 状态结构
+### 18.2 状态结构
 ```python
 class AgentState(BaseModel):
     session_id: str
@@ -621,14 +715,14 @@ class AgentState(BaseModel):
     current_step: int = 0
 ```
 
-### 17.3 控制规则
+### 18.3 控制规则
 1. 每轮先让 LLM 输出结构化 Thought/Action。
 2. 若 Action 是工具调用，则通过 ToolRegistry 执行。
 3. 将 Observation 追加回消息上下文。
 4. 达到 `max_steps` 或生成 `final_answer` 时终止。
 5. 工具异常必须进入 Observation，而不是直接崩溃。
 
-### 17.4 预留 Multi-Agent
+### 18.4 预留 Multi-Agent
 定义接口但首版不实现编排：
 ```python
 class PlannerAgent: ...
@@ -637,11 +731,11 @@ class RetrieverAgent: ...
 class EvaluatorAgent: ...
 ```
 
-### 17.5 面试点
+### 18.5 面试点
 该设计展示了“单 Agent 最小闭环 + 多 Agent 预留端口”的渐进式工程思路，避免过度设计。
 
-## 18. MCP Server 设计
-### 18.1 工具定义
+## 19. MCP Server 设计
+### 19.1 工具定义
 #### `query_knowledge_hub`
 输入：
 ```json
@@ -686,22 +780,22 @@ class EvaluatorAgent: ...
 }
 ```
 
-### 18.2 调用链路
+### 19.2 调用链路
 `MCP Client -> MCP Server -> Handler -> Application Service -> Domain Ports -> Infrastructure -> Response`
 
-### 18.3 实现约束
+### 19.3 实现约束
 1. 仅 `stdio transport`。
 2. Handler 负责 schema 校验和错误包装。
 3. Application Service 负责业务编排。
 4. 所有 tool 调用都必须产出 trace_id。
 
-## 19. 可观测性
-### 19.1 Trace 类型
+## 20. 可观测性
+### 20.1 Trace 类型
 1. Ingestion Trace
 2. Query Trace
 3. Agent Trace
 
-### 19.2 Trace 结构
+### 20.2 Trace 结构
 ```python
 class TraceEvent(BaseModel):
     trace_id: str
@@ -719,7 +813,7 @@ class TraceEvent(BaseModel):
     created_at: str
 ```
 
-### 19.3 JSON Lines 日志格式
+### 20.3 JSON Lines 日志格式
 ```json
 {"ts":"2026-05-04T12:00:00Z","level":"INFO","trace_id":"t1","module":"query_service","event":"dense_retrieval_done","provider":"chroma","latency_ms":42,"payload":{"top_k":20}}
 ```
@@ -727,10 +821,10 @@ class TraceEvent(BaseModel):
 字段要求：
 `ts, level, trace_id, module, event, provider, latency_ms, payload`
 
-### 19.4 设计说明
+### 20.4 设计说明
 JSON Lines 便于本地 grep、后续接 ELK/ClickHouse，也适合教学演示单次链路。
 
-## 20. Dashboard 设计
+## 21. Dashboard 设计
 页面必须包括：
 
 1. 系统总览  
@@ -752,32 +846,32 @@ JSON Lines 便于本地 grep、后续接 ELK/ClickHouse，也适合教学演示�
 1. Dashboard 只读核心数据，避免直接写复杂业务逻辑。
 2. 页面数据全部从 SQLite、Trace Repo、VectorStore 读取。
 
-## 21. 评估体系
-### 21.1 支持指标
+## 22. 评估体系
+### 22.1 支持指标
 1. Ragas：`faithfulness`, `answer_relevancy`, `context_precision`, `context_recall`
 2. 自定义：`hit_rate`, `mrr`
 
-### 21.2 hit_rate
+### 22.2 hit_rate
 命中定义：目标答案对应文档或 chunk 出现在 Top-K 中。
 ```python
 hit_rate = hit_count / total_queries
 ```
 
-### 21.3 MRR
+### 22.3 MRR
 ```python
 MRR = mean(1 / rank_of_first_relevant_doc)
 ```
 
-### 21.4 扩展预留
+### 22.4 扩展预留
 1. Agent trajectory correctness
 2. Tool call success rate
 3. Tool selection accuracy
 
-### 21.5 面试点
+### 22.5 面试点
 评估模块能体现“不是拍脑袋调参，而是数据驱动优化”。
 
-## 22. 数据流说明
-### 22.1 Ingestion Flow
+## 23. 数据流说明
+### 23.1 Ingestion Flow
 1. 读 PDF
 2. 算 SHA256
 3. 查增量表
@@ -791,7 +885,7 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 11. 写 SQLite 元数据
 12. 写 Trace
 
-### 22.2 Query Flow
+### 23.2 Query Flow
 1. 收到 MCP tool 请求
 2. 参数校验
 3. 召回记忆
@@ -803,7 +897,7 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 9. 输出引用
 10. 写记忆与 Trace
 
-### 22.3 Agent Flow
+### 23.3 Agent Flow
 1. 收到目标
 2. 读取短期与长期记忆
 3. 生成 Thought/Action
@@ -812,13 +906,13 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 6. 循环直到结束
 7. 写 episodic memory 和 Trace
 
-## 23. 测试方案
-### 23.1 总原则
+## 24. 测试方案
+### 24.1 总原则
 1. 核心领域逻辑优先 TDD。
 2. 所有 provider 适配器必须可 mock。
 3. 单元、集成、E2E 分层执行，不能混淆。
 
-### 23.2 单元测试
+### 24.2 单元测试
 覆盖：
 1. Chunk 构造与 metadata 注入
 2. RRF 融合
@@ -827,30 +921,30 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 5. Agent loop 终止条件
 6. settings 校验
 
-### 23.3 集成测试
+### 24.3 集成测试
 覆盖：
 1. MarkItDown -> Split -> Upsert 链路
 2. Chroma 检索 + BM25 融合
 3. SQLite 记忆读写
 4. MCP tool handler 到 service 的串联
 
-### 23.4 E2E 测试
+### 24.4 E2E 测试
 覆盖：
 1. 导入一个 PDF 后可成功查询
 2. `query_knowledge_hub` 返回 answer、citations、trace_id
 3. 记忆写入后下一轮问答可正确利用记忆
 4. Dashboard 能显示最新 trace 和评估结果
 
-### 23.5 RAG 专项测试
+### 24.5 RAG 专项测试
 1. retrieval 质量：固定样本集评估 `hit_rate/MRR`
 2. rerank 效果：比较 rerank 前后相关文档排名变化
 
-### 23.6 Agent 预留测试
+### 24.6 Agent 预留测试
 1. trajectory 测试
 2. tool 调用序列测试
 3. max_steps 安全测试
 
-## 24. 开发约束
+## 25. 开发约束
 1. Python 版本固定 `3.11+`
 2. 测试框架固定 `pytest`
 3. 格式化和 lint 使用 `ruff`
@@ -862,7 +956,7 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 9. 所有公共函数必须有类型标注
 10. 任何新功能都必须补测试和文档
 
-## 25. 项目排期
+## 26. 项目排期
 ### 阶段 A：骨架初始化
 | 任务 | 文件 | 类/函数 | 验收标准 | 测试 |
 |---|---|---|---|---|
@@ -927,7 +1021,7 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 | I2 Custom Metrics | `custom_metrics.py` | `hit_rate`, `mrr` | 指标正确 | 单测 |
 | I3 文档与样例数据 | `README.md`, `data/eval` | N/A | 可演示完整流程 | E2E 回归 |
 
-## 26. 进度跟踪表
+## 27. 进度跟踪表
 | 阶段 | 状态 | 完成标准 |
 |---|---|---|
 | A | 未开始 | 项目骨架和配置可运行 |
@@ -940,7 +1034,7 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 | H | 未开始 | Memory 和 Agent 最小闭环 |
 | I | 未开始 | 评估闭环与演示完成 |
 
-## 27. 面试回答点与扩展点
+## 28. 面试回答点与扩展点
 1. 为什么不用 LangChain/LlamaIndex  
 为了保持架构透明、降低黑盒依赖、便于讲解与控制每个环节。
 
@@ -956,28 +1050,28 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 5. 如何扩展  
 可扩展到新 VectorStore、新 LLM provider、Agent 反思机制、Planner/Executor 多 Agent、外部知识同步任务。
 
-## 28. 开发起始顺序
+## 29. 开发起始顺序
 建议严格按 `A -> B -> C -> D -> E -> F -> G -> H -> I` 推进，任何阶段未验收通过，不进入下一阶段。首个可演示里程碑是阶段 F，首个完整工程里程碑是阶段 I。
 
-## 29. 项目核心特色与工程亮点
-本项目不是一个“能跑起来就结束”的 RAG Demo，而是一套围绕真实 AI 系统工程设计的模块化骨架。其核心特色与亮点如下：
+## 30. 架构补充：项目核心特色与工程亮点
+本节保留为“厚版总结”，用于在整体设计梳理完成后，再从全局视角回看项目价值。前文第 2 章负责快速建立阅读认知，本节负责做更完整的归纳总结。
 
-### 29.1 一套工程骨架，同时服务三类目标
+### 30.1 一套工程骨架，同时服务三类目标
 1. 工程目标：形成可持续开发、可测试、可扩展的 AI 系统基础设施。
 2. 教学目标：每个模块都能独立拆出来讲清楚设计思路、技术选型与演进路径。
 3. 求职目标：每个模块都能映射到简历亮点、面试问题和实际项目经验表达。
 
-### 29.2 模块化而非黑盒集成
+### 30.2 模块化而非黑盒集成
 1. RAG 主链路中的 Loader、Splitter、Embedding、Retriever、Reranker、Evaluator 全部抽象化。
 2. Agent、Memory、Tool System 与 RAG 共享底层基础设施，而不是额外再起一套框架。
 3. 整体遵循“统一领域模型 + 可插拔实现 + 配置切换”的设计，避免项目后期出现体系分裂。
 
-### 29.3 兼顾学习价值与工业现实
+### 30.3 兼顾学习价值与工业现实
 1. 学习价值体现在链路透明：能清楚说明每个阶段输入、输出、边界和失败模式。
 2. 工业现实体现在工程约束：增量摄取、可观测性、评估闭环、配置驱动、分层测试。
 3. 不追求首版过度复杂，但关键架构点必须一步到位预留扩展空间。
 
-### 29.4 面向未来能力扩展
+### 30.4 面向未来能力扩展
 本项目首版聚焦单机、本地优先、单 Agent 最小闭环，但架构上必须为以下方向预留明确演进路径：
 1. Agentic RAG
 2. Multi-Agent 协作
@@ -985,84 +1079,84 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 4. 新模型与新检索后端切换
 5. 更细粒度的评估与自动回归体系
 
-## 30. 技术选型说明与架构取舍
+## 31. 架构补充：技术选型说明与架构取舍
 本节用于解释“为什么这样选”，它是技术选型说明、架构设计文档和面试回答素材的统一来源。
 
-### 30.1 总体取舍原则
+### 31.1 总体取舍原则
 1. 首版优先保证透明性与可解释性，而不是最短路径接 SDK 拼装。
 2. 首版优先保证本地可运行、可调试、可教学，而不是直接追求云原生复杂部署。
 3. 首版优先保证模块边界清晰，而不是为了省代码把逻辑堆在一起。
 
-### 30.2 为什么选择 MCP + stdio，而不是 HTTP API
+### 31.2 为什么选择 MCP + stdio，而不是 HTTP API
 1. MCP 能直接接入 Copilot、Claude Desktop 等 AI 客户端，具备更强的演示与实用价值。
 2. `stdio transport` 更适合本地子进程模式，避免引入额外服务治理与网络部署成本。
 3. 对求职项目而言，MCP 比普通 HTTP Chat API 更能体现对新型 AI 应用协议的理解。
 
-### 30.3 为什么禁止用 LangChain / LlamaIndex 做主编排
+### 31.3 为什么禁止用 LangChain / LlamaIndex 做主编排
 1. 黑盒太多，不利于讲清核心链路。
 2. 工程边界不够透明，不利于做强约束架构设计。
 3. 面试时更难讲明白“你自己到底设计了什么”。
 4. 仅保留 `RecursiveCharacterTextSplitter`，因为它在文本切分上足够成熟且替代成本低。
 
-### 30.4 为什么向量库首版选择 Chroma
+### 31.4 为什么向量库首版选择 Chroma
 1. 本地优先，易启动，适合教学和单机项目。
 2. 对首版数据规模足够，且能快速完成端到端闭环。
 3. 保留 `BaseVectorStore` 后，后续可平滑迁移到 Qdrant、Milvus、pgvector。
 
-### 30.5 为什么持久化首版选择 SQLite
+### 31.5 为什么持久化首版选择 SQLite
 1. 适合作为轻量元数据存储、trace 索引存储、memory 基础存储。
 2. 对本地开发和教学演示十分友好。
 3. 后续替换为 PostgreSQL 时，上层仓储接口可保持不变。
 
-### 30.6 为什么选择 Hybrid Retrieval + RRF + Rerank
+### 31.6 为什么选择 Hybrid Retrieval + RRF + Rerank
 1. BM25 擅长关键词匹配和专有名词查找。
 2. Dense Retrieval 擅长语义相似召回。
 3. RRF 实现简单、可解释性强、调参成本低。
 4. Rerank 将粗排结果进一步收敛为“适合生成答案”的上下文集合。
 
-### 30.7 为什么采用三层 Memory
+### 31.7 为什么采用三层 Memory
 1. 对话上下文、长期偏好、任务经历三类信息生命周期不同。
 2. 若统一存在一个池子里，会出现检索污染和无关上下文膨胀。
 3. 三层记忆使系统更接近真实 Agent 应用，而不是一次性问答机器人。
 
-## 31. 工业落地性与关键难点
+## 32. 工业落地性与关键难点
 本项目虽然以本地优先为首版路线，但必须从一开始考虑工业落地时真正会遇到的问题。
 
-### 31.1 文档摄取落地难点
+### 32.1 文档摄取落地难点
 1. PDF 结构噪声大，标题层级、页眉页脚、表格、图片位置经常不稳定。
 2. 图片与文本的对齐关系不总是明确，caption 注入位置容易影响检索质量。
 3. 同一文档重复导入、版本更新、局部修改会带来索引幂等和增量更新问题。
 
-### 31.2 检索落地难点
+### 32.2 检索落地难点
 1. 业务查询往往是口语化、模糊表达，不一定与文档写法一致。
 2. 纯向量检索容易漏专有名词，纯 BM25 容易漏语义变体。
 3. 检索不是最终目标，真正目标是为后续回答生成提供正确上下文。
 
-### 31.3 生成落地难点
+### 32.3 生成落地难点
 1. 检索到“相关”上下文不代表生成一定正确。
 2. 多段上下文拼接会出现上下文冲突、冗余和 token 浪费。
 3. 若无引用与 trace，很难定位幻觉来源。
 
-### 31.4 Agent 落地难点
+### 32.4 Agent 落地难点
 1. Agent 的失败常常不是“模型能力不够”，而是工具边界不清、状态管理混乱。
 2. 记忆写得太多会污染后续推理，写得太少又失去个性化与连续性。
 3. 缺乏 trajectory 级 trace 时，很难调试 Thought-Action-Observation 的失败原因。
 
-### 31.5 评估落地难点
+### 32.5 评估落地难点
 1. 离线评估分数高，不代表真实用户问题一定表现好。
 2. 单看 answer quality 不足以定位到底是 retrieval、rerank 还是 prompt 的问题。
 3. 若没有回归集，模型或参数变更后很容易“优化一处，退化一片”。
 
-### 31.6 本项目的落地性回答口径
+### 32.6 本项目的落地性回答口径
 在面试或汇报中，应明确：
 1. 首版系统选择本地优先，是为了降低复杂度并尽快形成可验证闭环。
 2. 架构上已经通过接口抽象、配置驱动、数据分层，为后续生产化迁移保留路径。
 3. 真正的工程价值不在于“堆更多组件”，而在于把链路做透明、可测、可迭代。
 
-## 32. 模块设计沟通原则
+## 33. 模块设计沟通原则
 从当前阶段开始，后续所有模块细化都应以“架构设计讨论优先”而不是“先写代码”为原则。
 
-### 32.1 每个模块在细化时必须回答六个问题
+### 33.1 每个模块在细化时必须回答六个问题
 1. 这个模块的职责边界是什么。
 2. 这个模块与上下游的输入输出契约是什么。
 3. 这个模块的关键技术难点是什么。
@@ -1070,7 +1164,7 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 5. 这个模块未来如何扩展。
 6. 这个模块如何转化为面试表达与简历亮点。
 
-### 32.2 每个模块的补充结构模板
+### 33.2 每个模块的补充结构模板
 后续细化时，统一采用如下结构：
 1. 模块目标
 2. 职责边界
@@ -1082,35 +1176,35 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 8. 高频面试题
 9. 简历撰写建议
 
-## 33. 模块详解：Ingestion Pipeline
-### 33.1 模块目标
+## 34. 模块详解：Ingestion Pipeline
+### 34.1 模块目标
 将原始 PDF 文档转换为适合后续检索与生成使用的高质量 chunk 资产，并以可追踪、可增量、可复用的方式写入本地知识库。
 
-### 33.2 架构设计亮点
+### 34.2 架构设计亮点
 1. 采用“文件级去重 + chunk 级标准化 + trace 记录”的工程化摄取链路。
 2. 使用 Markdown 作为中间统一表示，降低后续 Splitter 和增强逻辑的复杂度。
 3. 将多模态处理纳入摄取阶段，而不是查询阶段临时处理，减少查询时延。
 
-### 33.3 关键技术难点
+### 34.3 关键技术难点
 1. PDF 转 Markdown 后可能出现结构噪声。
 2. chunk 切分过细会丢上下文，过粗会影响召回精度与 token 成本。
 3. LLM 重写虽能提升语义完整性，但也可能引入改写偏差。
 4. 图片 caption 若注入不当，会污染原始语义。
 
-### 33.4 扩展方向与建议
+### 34.4 扩展方向与建议
 1. 增加更多 Loader，如 Markdown、HTML、Code Repo。
 2. 支持 chunk 质量评估与自动清洗。
 3. 支持文档版本对比与局部重建索引。
 4. 支持 OCR 与表格结构化抽取。
 
-### 33.5 知识点清单
+### 34.5 知识点清单
 1. PDF 解析与文本结构化
 2. Markdown 作为中间表示的优势
 3. 智能切分策略与 chunk granularity
 4. 多模态 captioning 的基本原理
 5. 增量索引与幂等摄取
 
-### 33.6 高频面试题
+### 34.6 高频面试题
 1. 为什么先把 PDF 转成 Markdown，而不是直接对 PDF 提取纯文本切块？  
 参考回答：Markdown 保留了更多结构信息，如标题、列表、段落层级，更适合作为后续语义分块和元数据注入的中间层。
 
@@ -1120,40 +1214,40 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 3. 增量摄取为什么重要？  
 参考回答：真实业务中知识库会反复更新，如果每次全量重跑，成本和延迟都不可接受，因此需要哈希跳过与幂等 upsert。
 
-### 33.7 简历撰写建议
+### 34.7 简历撰写建议
 可写为：
 “设计并实现模块化文档摄取链路，支持 PDF→Markdown→语义分块→多模态增强→向量化的端到端处理；通过 SHA256 增量跳过与可观测 Trace 机制提升知识库更新效率与可调试性。”
 
-## 34. 模块详解：Retrieval / Rerank / Context
-### 34.1 模块目标
+## 35. 模块详解：Retrieval / Rerank / Context
+### 35.1 模块目标
 在查询阶段以低延迟、高召回、强可解释性的方式找到最相关的知识片段，并构造成适合 LLM 使用的上下文。
 
-### 34.2 架构设计亮点
+### 35.2 架构设计亮点
 1. Hybrid Retrieval 同时覆盖关键词精确匹配与语义检索。
 2. RRF 作为融合层，兼具实现简单和面试可解释性。
 3. Rerank 作为精排层，使检索链路具备“粗排召回 + 精排过滤”的工业形态。
 4. Context Builder 将 metadata、图片描述、memory 统一纳入上下文编排。
 
-### 34.3 关键技术难点
+### 35.3 关键技术难点
 1. Query 与文档语义空间不一致时，Dense Retrieval 也可能失效。
 2. BM25 和 Dense 分数不可直接比较，因此需要融合层。
 3. Rerank 提升精度的同时也引入额外成本。
 4. Context 构建不只是“拼字符串”，而是信息压缩与冲突控制问题。
 
-### 34.4 扩展方向与建议
+### 35.4 扩展方向与建议
 1. 增加 query rewrite、self-query、multi-query retrieval。
 2. 增加更细粒度 rerank 策略与预算控制。
 3. 支持 chunk window 扩展与 parent-child retrieval。
 4. 支持基于用户画像或记忆的 personalized retrieval。
 
-### 34.5 知识点清单
+### 35.5 知识点清单
 1. BM25 原理
 2. Dense Retrieval 与 embedding space
 3. Bi-Encoder vs Cross-Encoder
 4. Reciprocal Rank Fusion
 5. Context window 预算与 prompt packing
 
-### 34.6 高频面试题
+### 35.6 高频面试题
 1. 为什么 BM25 和 Dense 要一起用？  
 参考回答：两者擅长的匹配模式不同，BM25 对专有名词、代码名、缩写更敏感，Dense 对语义近义表达更强，组合后查全率更高。
 
@@ -1166,182 +1260,182 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 4. 检索做好了为什么还会答错？  
 参考回答：因为 RAG 是“检索 + 上下文构建 + 生成”的系统，检索正确不代表上下文拼装和生成一定正确。
 
-### 34.7 简历撰写建议
+### 35.7 简历撰写建议
 可写为：
 “构建 Hybrid Retrieval 检索链路，结合 BM25、Dense Embedding、RRF 融合与 Cross-Encoder/LLM Rerank，实现粗排召回与精排过滤两阶段架构，并设计上下文构建模块提升回答可解释性。”
 
-## 35. 模块详解：Memory System
-### 35.1 模块目标
+## 36. 模块详解：Memory System
+### 36.1 模块目标
 为 RAG 与 Agent 提供持续性上下文，使系统具备短期连续对话能力、长期偏好记忆能力和任务级经历积累能力。
 
-### 35.2 架构设计亮点
+### 36.2 架构设计亮点
 1. 采用短期、长期、事件三层结构，显式区分不同生命周期信息。
 2. 同时使用 SQLite 与向量存储，兼顾结构化过滤与语义检索。
 3. 引入摘要与压缩机制，控制记忆规模膨胀。
 
-### 35.3 关键技术难点
+### 36.3 关键技术难点
 1. 什么信息应该被记住，什么应该被丢弃。
 2. 记忆检索相关性如何定义，如何避免污染当前任务。
 3. 摘要压缩后如何保证关键信息不丢失。
 
-### 35.4 扩展方向与建议
+### 36.4 扩展方向与建议
 1. 增加 memory importance scoring。
 2. 增加用户画像抽取与偏好学习。
 3. 增加记忆衰减、过期与冲突消解机制。
 4. 增加 episodic reflection 与任务复盘。
 
-### 35.5 知识点清单
+### 36.5 知识点清单
 1. Memory 分类方法
 2. 记忆检索与向量索引
 3. 摘要压缩与信息保真
 4. 个性化推荐与用户画像基础
 
-### 35.6 高频面试题
+### 36.6 高频面试题
 1. 为什么不用一个统一 memory 表解决所有问题？  
 参考回答：不同类型记忆的生命周期、召回方式和使用场景不同，混用会造成上下文污染与检索噪声。
 
 2. 记忆系统的核心难点是什么？  
 参考回答：不是“存下来”本身，而是何时写入、何时压缩、何时召回，以及如何避免无关信息干扰当前推理。
 
-### 35.7 简历撰写建议
+### 36.7 简历撰写建议
 可写为：
 “设计三层 Memory System，结合 SQLite 结构化存储与向量检索实现短期对话、长期偏好和任务经历管理，并引入自动摘要压缩机制控制上下文膨胀。”
 
-## 36. 模块详解：Tool System 与 Agent Framework
-### 36.1 模块目标
+## 37. 模块详解：Tool System 与 Agent Framework
+### 37.1 模块目标
 构建统一工具抽象与最小 Agent 执行闭环，为后续 Tool Use、ReAct、Multi-Agent 协作提供基础。
 
-### 36.2 架构设计亮点
+### 37.2 架构设计亮点
 1. Tool 抽象独立于 MCP，使本地工具与 MCP 工具能统一调度。
 2. Agent Loop 采用最小 Thought-Action-Observation 闭环，结构清晰，便于教学与调试。
 3. Tool Trace 与 Agent Trace 统一记录，便于排障和评估。
 
-### 36.3 关键技术难点
+### 37.3 关键技术难点
 1. 工具 schema 设计不清晰会导致模型调用失败率高。
 2. Agent 的失败常常来自状态不一致，而非单次模型输出错误。
 3. 如果没有步骤限制和异常观察机制，Agent 很容易失控。
 
-### 36.4 扩展方向与建议
+### 37.4 扩展方向与建议
 1. 增加结构化 Thought/Action 输出协议。
 2. 增加 planner-executor 模式。
 3. 增加反思（reflection）与重试策略。
 4. 增加 tool choice evaluation。
 
-### 36.5 知识点清单
+### 37.5 知识点清单
 1. ReAct 思想
 2. Tool Calling 机制
 3. Function schema 设计
 4. Agent trajectory 与状态机
 
-### 36.6 高频面试题
+### 37.6 高频面试题
 1. 为什么要把 MCP tools 和本地 tools 统一抽象？  
 参考回答：后续 Agent 不应该关心工具来源，只应该依赖统一调用协议，这样系统扩展性更强。
 
 2. Agent 和普通 RAG 的区别是什么？  
 参考回答：普通 RAG 主要是一次性检索增强生成，Agent 则具备目标驱动、工具调用、状态演化与多步推理能力。
 
-### 36.7 简历撰写建议
+### 37.7 简历撰写建议
 可写为：
 “设计统一 Tool System 与最小 ReAct Agent Loop，将 MCP tools 与本地 tools 纳入统一注册和调度体系，为后续 Multi-Agent 与任务自动化扩展提供基础。”
 
-## 37. 模块详解：MCP Server
-### 37.1 模块目标
+## 38. 模块详解：MCP Server
+### 38.1 模块目标
 将内部 RAG/Memory/Agent 能力以标准 MCP Tool 形式暴露给外部 AI 客户端，实现一次开发、多客户端复用。
 
-### 37.2 架构设计亮点
+### 38.2 架构设计亮点
 1. 面向 MCP 标准设计，而不是单一 UI 或单一 API。
 2. 使用 `stdio transport` 贴合本地 Agent/编辑器集成场景。
 3. MCP Handler 与业务服务解耦，保证协议层和业务层边界清晰。
 
-### 37.3 关键技术难点
+### 38.3 关键技术难点
 1. tool 输入输出 schema 必须稳定，否则客户端适配成本高。
 2. 若错误结构不统一，客户端难以恢复与调试。
 3. tool 的语义边界如果不清晰，会造成“一个 tool 过大”或“tool 过碎”。
 
-### 37.4 扩展方向与建议
+### 38.4 扩展方向与建议
 1. 增加更多资源型接口与只读知识资源。
 2. 增加 memory、agent、evaluation 相关 MCP tools。
 3. 增加 capability discovery 和工具版本兼容策略。
 
-### 37.5 知识点清单
+### 38.5 知识点清单
 1. MCP 协议基础
 2. Tool schema 设计
 3. stdio transport 工作方式
 4. 协议层与业务层分离
 
-### 37.6 高频面试题
+### 38.6 高频面试题
 1. 为什么这个项目不用 HTTP，而选择 MCP stdio？  
 参考回答：因为项目目标是与 AI 助手深度集成，MCP 在这类场景下更自然，stdio 也更适合本地子进程模式。
 
 2. MCP tool 设计的关键是什么？  
 参考回答：关键是边界稳定、输入输出清晰、错误可恢复、调用链路可追踪。
 
-### 37.7 简历撰写建议
+### 38.7 简历撰写建议
 可写为：
 “基于 Python MCP SDK 设计本地 `stdio` 模式 MCP Server，将模块化 RAG 能力封装为标准 tools，支持外部 AI 客户端直接调用，提升系统复用性与协议集成能力。”
 
-## 38. 模块详解：可观测性、Dashboard 与评估
-### 38.1 模块目标
+## 39. 模块详解：可观测性、Dashboard 与评估
+### 39.1 模块目标
 让系统不仅“能跑”，还要能解释、能回放、能评估、能持续迭代优化。
 
-### 38.2 架构设计亮点
+### 39.2 架构设计亮点
 1. Trace 同时覆盖 Ingestion、Query、Agent 三类主链路。
 2. Dashboard 不直接承载主逻辑，只负责把系统状态和链路透明化。
 3. 评估模块与运行链路解耦，可独立执行离线评测和回归分析。
 
-### 38.3 关键技术难点
+### 39.3 关键技术难点
 1. 没有 Trace 时很难定位问题是在解析、检索、重排还是生成。
 2. 没有 Dashboard 时系统虽能工作，但调试效率很低。
 3. 没有评估闭环时，系统优化很容易变成主观调参。
 
-### 38.4 扩展方向与建议
+### 39.4 扩展方向与建议
 1. 增加 trace 可视化瀑布图与阶段对比。
 2. 增加评估任务历史对比与回归预警。
 3. 增加 tool use correctness 和 agent trajectory 评估。
 4. 增加日志接入 ELK、ClickHouse 或 OpenTelemetry。
 
-### 38.5 知识点清单
+### 39.5 知识点清单
 1. 结构化日志
 2. Trace 与 Span 基础
 3. Ragas 指标含义
 4. Hit Rate / MRR 的适用场景
 5. 离线评估与在线反馈差异
 
-### 38.6 高频面试题
+### 39.6 高频面试题
 1. 为什么 RAG 项目一定要做可观测性？  
 参考回答：因为 RAG 是多阶段流水线，没有中间态可视化就无法定位问题，更无法稳定迭代。
 
 2. 为什么评估不能只看最终回答质量？  
 参考回答：因为最终回答质量只是结果指标，无法帮助定位问题究竟出在 retrieval、rerank 还是 context build。
 
-### 38.7 简历撰写建议
+### 39.7 简历撰写建议
 可写为：
 “搭建 RAG 系统可观测与评估闭环，设计 Ingestion/Query/Agent Trace、Streamlit Dashboard 及 Ragas + 自定义指标体系，支撑数据驱动的质量优化与回归测试。”
 
-## 39. 教学、面试与简历输出规范
+## 40. 教学、面试与简历输出规范
 本项目每个核心模块都必须产出三类附属材料，作为后续持续完善的一部分。
 
-### 39.1 知识点清单产出规范
+### 40.1 知识点清单产出规范
 每个模块都要列出：
 1. 核心原理
 2. 常见替代方案
 3. 工程实现中的关键取舍
 4. 与项目代码的对应关系
 
-### 39.2 高频面试题产出规范
+### 40.2 高频面试题产出规范
 每个模块至少准备：
 1. 原理题
 2. 设计题
 3. 工程权衡题
 4. 故障定位题
 
-### 39.3 简历撰写建议产出规范
+### 40.3 简历撰写建议产出规范
 每个模块都要形成：
 1. 一条偏架构亮点的简历描述
 2. 一条偏工程落地的简历描述
 3. 一条偏 AI 系统特色的简历描述
 
-### 39.4 后续细化方式
+### 40.4 后续细化方式
 从下一轮开始，逐个模块深挖时，除补充架构与流程外，还必须同步补充：
 1. 该模块知识点清单
 2. 高频面试题与参考回答
