@@ -283,8 +283,9 @@ class Chunk(BaseModel):
     chunk_id: str
     doc_id: str
     chunk_index: int
-    text: str
-    rewritten_text: str | None = None
+    raw_text: str
+    normalized_text: str
+    enriched_text: str | None = None
     title_path: list[str] = Field(default_factory=list)
     page_range: list[int] = Field(default_factory=list)
     image_captions: list[str] = Field(default_factory=list)
@@ -293,6 +294,9 @@ class Chunk(BaseModel):
     dense_text: str
     token_count: int
     content_hash: str
+    embedding_model_version: str
+    embedding_fingerprint: str
+    is_deleted: bool = False
 ```
 
 ### 8.3 QueryContext
@@ -486,6 +490,17 @@ evaluation:
   dataset_dir: ./data/eval
   metrics: [hit_rate, mrr, faithfulness, answer_relevancy]
 
+bm25:
+  artifact_dir: ./data/processed/bm25
+  active_artifact: bm25_active.pkl
+  building_artifact: bm25_building.pkl
+  meta_file: bm25_meta.json
+  rebuild_debounce_seconds: 30
+  deleted_ratio_rebuild_threshold: 0.2
+  deleted_count_rebuild_threshold: 1000
+  search_prefetch_multiplier: 4
+  enable_force_rebuild: true
+
 observability:
   log_path: ./data/traces/app.jsonl
   trace_db: ./data/sqlite/traces.db
@@ -511,23 +526,28 @@ mcp:
 `PDF -> Markdown -> Split -> LLM Enrich -> Dual Embedding -> Upsert -> Trace -> Incremental Record`
 
 ### 12.2 详细步骤
-1. 文件发现：读取待导入 PDF。
+1. 文件发现：支持 `单文件导入` 与 `目录批量导入` 两种入口，目录模式复用单文件处理链路。
 2. 哈希计算：对原始文件计算 `SHA256`。
 3. 增量跳过：查询 `ingestion_history`，若哈希已成功处理则直接跳过。
 4. PDF 转 Markdown：调用 MarkItDown，产出统一 Markdown 文本。
 5. 图片抽取：识别页面图片并获取二进制数据或引用。
-6. 智能分块：使用 `RecursiveCharacterTextSplitter` 按 Markdown 标题与段落切分。
-7. LLM 增强：
-   - 重写：清理碎片、补足上下文指代。
+6. Markdown 规范化：在 Loader 阶段完成基础清噪与结构规范化，包括页眉页脚、页码噪声、重复标题清理，并尽量保留 `# / ##` 标题层级与块级结构。
+7. 智能分块：使用 `RecursiveCharacterTextSplitter` 按 Markdown 标题与段落切分，默认 `chunk_size=900`、`chunk_overlap=180`。
+8. LLM 增强：
+   - 增强粒度为 `chunk-level processing with local context window`，即“先切 chunk，再以当前 chunk 为中心，附带邻接上下文做增强”。
+   - 重写：仅做 retrieval-oriented enrichment，清理碎片、补足上下文指代，不允许自由摘要式改写。
    - 元数据注入：标题路径、页码范围、来源文档等。
    - 图片描述：Vision LLM 对图片生成中文描述。
+   - 降级策略：若增强失败，则回退到 `normalized_text`，不得阻断整条链路。
 8. 双路文本构建：
-   - `sparse_text = 原文 + 标题 + 关键词`
-   - `dense_text = 重写文本 + 图片描述 + 元数据上下文`
-9. Embedding：仅对 `dense_text` 做向量化。
-10. Upsert：将 chunk、metadata、vector 写入 Chroma。
-11. BM25 建索引：将 `sparse_text` 写入本地 BM25 索引。
-12. 记录 Trace、日志与 ingestion_history。
+   - `sparse_text = raw_text/normalized_text + 标题 + 关键词`
+   - `dense_text = enriched_text + 图片描述 + 元数据上下文`
+10. Embedding：仅对 `dense_text` 做向量化，并写入 `embedding_model_version` 与 `embedding_fingerprint`。
+11. Upsert：将 chunk、metadata、vector 写入 Chroma。
+12. BM25 建索引：以 SQLite `chunks` 表为唯一事实源，异步维护本地 BM25 artifact。
+13. 中间产物持久化：保留原始 Markdown、规范化 Markdown、chunk 切分结果、enriched 结果，供 Dashboard、调试与教学使用。
+14. 记录 Trace、日志与 ingestion_history。
+15. 若触发删除链路，则执行反向同步：删除 Chroma 数据、软删除 SQLite chunks、更新 BM25 artifact，并逻辑保留 trace。
 
 ### 12.3 Ingestion I/O
 ```python
@@ -555,6 +575,32 @@ CREATE TABLE ingestion_history (
 ### 12.5 设计说明
 这样设计的原因是把“是否需要重跑”前置到最便宜的阶段，避免重复调用 MarkItDown、Vision LLM、Embedding。面试时可强调“零成本增量更新”和“幂等摄取”。
 
+### 12.6 BM25 索引生命周期设计
+1. SQLite `chunks` 表是 BM25 的唯一事实源，BM25 `.pkl` 只是派生索引，不是真实数据源。
+2. 进程内维护 `BM25Searcher` 活跃实例，查询线程只读，不参与重建过程。
+3. 磁盘上至少维护：
+   - `bm25_active.pkl`
+   - `bm25_building.pkl`
+   - `bm25_meta.json`
+4. `pickle` artifact 必须同时保存：
+   - `bm25 model`
+   - `row_index -> chunk_id`
+   - `chunk_id -> row_index`
+   - `index_version / build metadata`
+5. 新增或更新文档后，采用“后台全量重建 + 内存原子替换”的双缓冲方案。
+6. 删除文档后，优先在查询结果层按 `is_deleted` 过滤，达到阈值后再触发彻底重建。
+7. 原子切换前，必须对 `bm25_building.pkl` 做一次 `load_test`，确认新 artifact 可被正常读取，防止坏文件上线。
+8. 重建过程不得阻塞搜索请求，最终语义为“查询不停机 + 最终一致”。
+
+### 12.7 BM25 重建调度策略
+1. 默认启用“防抖自动触发”，保证普通用户无需手动维护索引即可在短时间内达到最终一致。
+2. 同时提供“显式强制重建”，用于批量导入后立即确认、异步任务异常恢复、分词/索引逻辑迁移等场景。
+3. 自动触发与强制触发必须通过 `Rebuild Lock` 互斥：
+   - 自动请求只会启动或重置定时器。
+   - 强制请求会取消现有定时器，并立即发起后台重建任务。
+4. 若已有重建线程在运行，新的请求不能并发打架，应等待完成或将旧任务标记失效。
+5. 该设计兼顾系统自觉性与高级用户掌控感，是首版可落地且易讲清楚的折中方案。
+
 ## 13. Retrieval Pipeline
 ### 13.1 查询主链路
 `Query Normalize -> Memory Recall -> Dense Retrieve -> BM25 Retrieve -> RRF Fusion -> Rerank -> Context Build -> Answer Generate`
@@ -563,7 +609,7 @@ CREATE TABLE ingestion_history (
 1. 查询标准化：去空白、统一大小写、保留原始 query。
 2. Memory 检索：若有 `conversation_id/user_id`，先召回短期摘要和长期记忆。
 3. Dense 检索：向量检索获取 `top_k_retrieval`。
-4. Sparse 检索：BM25 获取 `top_k_retrieval`。
+4. Sparse 检索：BM25 初始获取比目标更大的候选集，默认 `top_k_retrieval * search_prefetch_multiplier`，然后过滤软删除项与无效项。
 5. RRF 融合：使用统一 chunk_id 去重融合。
 6. 精排：
    - 默认 Cross-Encoder 重排。
@@ -876,14 +922,15 @@ MRR = mean(1 / rank_of_first_relevant_doc)
 2. 算 SHA256
 3. 查增量表
 4. 转 Markdown
-5. 抽图并 caption
-6. 分块
-7. LLM 增强
-8. 构造 sparse/dense 文本
-9. 写向量库
-10. 写 BM25
-11. 写 SQLite 元数据
-12. 写 Trace
+5. 规范化 Markdown 与基础清噪
+6. 抽图并 caption
+7. 分块
+8. 基于局部上下文窗口做 chunk 级增强
+9. 构造 sparse/dense 文本
+10. 写向量库
+11. 写 SQLite 元数据与中间产物
+12. 异步刷新 BM25 artifact
+13. 写 Trace
 
 ### 23.2 Query Flow
 1. 收到 MCP tool 请求
@@ -1184,18 +1231,21 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 1. 采用“文件级去重 + chunk 级标准化 + trace 记录”的工程化摄取链路。
 2. 使用 Markdown 作为中间统一表示，降低后续 Splitter 和增强逻辑的复杂度。
 3. 将多模态处理纳入摄取阶段，而不是查询阶段临时处理，减少查询时延。
+4. BM25 采用“SQLite 事实源 + 双缓冲 artifact + 逻辑删除过滤”的组合策略，在实现复杂度和工程稳定性之间取得平衡。
 
 ### 34.3 关键技术难点
 1. PDF 转 Markdown 后可能出现结构噪声。
 2. chunk 切分过细会丢上下文，过粗会影响召回精度与 token 成本。
 3. LLM 重写虽能提升语义完整性，但也可能引入改写偏差。
 4. 图片 caption 若注入不当，会污染原始语义。
+5. BM25 与 SQLite/Chroma 的一致性维护，是本地优先知识库系统最容易被忽视但最影响稳定性的部分。
 
 ### 34.4 扩展方向与建议
 1. 增加更多 Loader，如 Markdown、HTML、Code Repo。
 2. 支持 chunk 质量评估与自动清洗。
 3. 支持文档版本对比与局部重建索引。
 4. 支持 OCR 与表格结构化抽取。
+5. 支持基于 `embedding_fingerprint` 的批量重嵌入与索引迁移。
 
 ### 34.5 知识点清单
 1. PDF 解析与文本结构化
@@ -1214,9 +1264,12 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 3. 增量摄取为什么重要？  
 参考回答：真实业务中知识库会反复更新，如果每次全量重跑，成本和延迟都不可接受，因此需要哈希跳过与幂等 upsert。
 
+4. 为什么 BM25 采用“自动防抖 + 强制重建”双机制？  
+参考回答：自动防抖保证普通用户上传后无需人工干预也能最终一致；强制重建则用于批量导入后的即时确认、异步异常恢复和索引逻辑迁移，这体现的是工程系统的“自觉性 + 掌控感”。
+
 ### 34.7 简历撰写建议
 可写为：
-“设计并实现模块化文档摄取链路，支持 PDF→Markdown→语义分块→多模态增强→向量化的端到端处理；通过 SHA256 增量跳过与可观测 Trace 机制提升知识库更新效率与可调试性。”
+“设计并实现模块化文档摄取链路，支持 PDF→Markdown→结构规范化→语义分块→多模态增强→向量化的端到端处理；通过 SHA256 增量跳过、BM25 双缓冲重建与可观测 Trace 机制提升知识库更新效率、一致性与可调试性。”
 
 ## 35. 模块详解：Retrieval / Rerank / Context
 ### 35.1 模块目标
