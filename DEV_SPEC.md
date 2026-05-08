@@ -601,6 +601,368 @@ CREATE TABLE ingestion_history (
 4. 若已有重建线程在运行，新的请求不能并发打架，应等待完成或将旧任务标记失效。
 5. 该设计兼顾系统自觉性与高级用户掌控感，是首版可落地且易讲清楚的折中方案。
 
+### 12.8 SQLite 元数据表设计总则
+1. `documents / chunks / document_images / ingestion_history` 是 Ingestion 首版的四张核心元数据表。
+2. `documents / chunks / document_images` 采用软删除策略；`ingestion_history` 永久保留，不做物理删除。
+3. 大型中间产物不直接内嵌存储在 SQLite 中，而是落盘到 `data/processed/`，数据库仅保存引用路径。
+4. 所有字段在设计时分为三类：
+   - `首版必须保留`：首版实现、删除反向链路、BM25/Chroma 重建、Dashboard、教学演示都依赖。
+   - `首版建议保留`：首版不一定作为主流程强依赖，但保留后能显著提升调试性、可讲解性与后续扩展质量。
+   - `扩展保留`：首版可以不参与核心逻辑，但建议在 schema 中预留或在文档中明确保留意图。
+5. `logical_doc_id + version` 是文档版本演进的核心设计，必须写入首版 schema。它不仅服务工程更新语义，也服务教学演示、实验对比与面试表达。
+6. `embedding_fingerprint` 是首版必须保留的高级字段，用于解决 embedding 模型静默升级、增强逻辑变化、dense_text 变化后向量状态失真但系统无感知的问题。
+
+### 12.9 documents 表设计
+```sql
+CREATE TABLE documents (
+  doc_id TEXT PRIMARY KEY,
+  logical_doc_id TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+
+  collection_name TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_ext TEXT NOT NULL DEFAULT 'pdf',
+
+  sha256 TEXT NOT NULL,
+  file_size_bytes INTEGER,
+  mime_type TEXT DEFAULT 'application/pdf',
+
+  title TEXT,
+  author TEXT,
+  language TEXT DEFAULT 'zh',
+  page_count INTEGER DEFAULT 0,
+
+  raw_markdown_path TEXT,
+  normalized_markdown_path TEXT,
+
+  loader_name TEXT NOT NULL,
+  loader_version TEXT,
+  normalization_version TEXT,
+
+  status TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+
+  deleted_at TEXT,
+  deleted_reason TEXT,
+
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  indexed_at TEXT,
+
+  UNIQUE(logical_doc_id, version)
+);
+```
+
+字段设计说明：
+
+| 字段 | 含义 | 保留级别 | 设计备注 |
+|---|---|---|---|
+| `doc_id` | 当前文档版本实例 ID | 首版必须保留 | 物理文档主键，建议包含版本信息。 |
+| `logical_doc_id` | 逻辑文档稳定 ID | 首版必须保留 | 同一份文档多次更新仍保持不变；用于版本演进、对比实验和删除反向链路。 |
+| `version` | 当前逻辑文档的版本号 | 首版必须保留 | 支持“同一文档不同切分/增强/索引策略”的教学与实验演示。 |
+| `collection_name` | 所属知识库集合 | 首版必须保留 | 便于按 collection 做导入、删除、重建与 Dashboard 展示。 |
+| `source_path` | 原始文件路径 | 首版必须保留 | 用于追踪来源与重复导入判断。 |
+| `file_name` | 文件名 | 首版必须保留 | Dashboard 与引用展示直接使用。 |
+| `file_ext` | 文件扩展名 | 首版必须保留 | 首版实现只处理 PDF，但接口要支持未来扩展。 |
+| `sha256` | 文件级哈希 | 首版必须保留 | 文件级幂等跳过核心字段。 |
+| `file_size_bytes` | 文件大小 | 首版必须保留 | 便于导入统计、异常排查与 UI 展示。 |
+| `mime_type` | MIME 类型 | 首版建议保留 | 首版默认 PDF，后续扩展 HTML/Markdown 时更通用。 |
+| `title` | 文档标题 | 首版建议保留 | 可从内容推断或手工填充，便于展示。 |
+| `author` | 文档作者 | 扩展保留 | 首版不强依赖，后续可用于文档属性增强。 |
+| `language` | 语言标记 | 首版建议保留 | 后续分词、提示词和评估策略可参考。 |
+| `page_count` | 总页数 | 首版必须保留 | 与图片、页码引用、Trace 展示密切相关。 |
+| `raw_markdown_path` | 原始 Markdown 产物路径 | 首版必须保留 | 用于区分解析错误和规范化错误，是教学与调试关键资产。 |
+| `normalized_markdown_path` | 规范化 Markdown 路径 | 首版必须保留 | 是 Splitter 的直接输入引用。 |
+| `loader_name` | 使用的 Loader 名称 | 首版必须保留 | 首版通常为 MarkItDown PDF Loader。 |
+| `loader_version` | Loader 版本 | 首版建议保留 | 首版不强依赖，但解析器升级后便于识别历史文档。 |
+| `normalization_version` | 规范化逻辑版本 | 首版必须保留 | 页眉页脚清理、标题去重等策略变化后可用于重跑判定。 |
+| `status` | 当前文档状态 | 首版必须保留 | 建议枚举：`pending / processing / success / failed / deleted`。 |
+| `is_active` | 是否为当前活跃版本 | 首版必须保留 | 文档更新采用“旧版本失活 + 新版本插入”。 |
+| `is_deleted` | 是否逻辑删除 | 首版必须保留 | 反向删除链路与查询过滤依赖。 |
+| `deleted_at` | 删除时间 | 首版建议保留 | 有助于审计与清理任务。 |
+| `deleted_reason` | 删除原因 | 扩展保留 | 首版通常是用户手动删除，不是关键逻辑字段，但建议预留口径。 |
+| `created_at` | 创建时间 | 首版必须保留 | 审计和排序展示必需。 |
+| `updated_at` | 更新时间 | 首版必须保留 | 版本和状态变化追踪。 |
+| `indexed_at` | 最近一次索引完成时间 | 首版必须保留 | 便于判断摄取与检索资产是否已同步。 |
+
+### 12.10 chunks 表设计
+```sql
+CREATE TABLE chunks (
+  chunk_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  logical_doc_id TEXT NOT NULL,
+  collection_name TEXT NOT NULL,
+
+  chunk_index INTEGER NOT NULL,
+  parent_section_id TEXT,
+  section_path TEXT,
+  title_path_json TEXT NOT NULL,
+
+  page_start INTEGER,
+  page_end INTEGER,
+
+  raw_text TEXT NOT NULL,
+  normalized_text TEXT NOT NULL,
+  enriched_text TEXT,
+
+  sparse_text TEXT NOT NULL,
+  dense_text TEXT NOT NULL,
+
+  token_count INTEGER DEFAULT 0,
+  char_count INTEGER DEFAULT 0,
+
+  content_hash TEXT NOT NULL,
+  chunking_version TEXT NOT NULL,
+  enrichment_version TEXT NOT NULL,
+  caption_version TEXT,
+
+  embedding_provider TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_model_version TEXT NOT NULL,
+  embedding_dimension INTEGER,
+  embedding_fingerprint TEXT NOT NULL,
+
+  vector_store_provider TEXT DEFAULT 'chroma',
+  vector_store_collection TEXT,
+  bm25_index_version TEXT,
+
+  image_count INTEGER DEFAULT 0,
+  has_image INTEGER NOT NULL DEFAULT 0,
+  synthetic_image_chunk INTEGER NOT NULL DEFAULT 0,
+
+  is_active INTEGER NOT NULL DEFAULT 1,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+
+  FOREIGN KEY(doc_id) REFERENCES documents(doc_id)
+);
+```
+
+字段设计说明：
+
+| 字段 | 含义 | 保留级别 | 设计备注 |
+|---|---|---|---|
+| `chunk_id` | chunk 主键 | 首版必须保留 | 建议全局唯一，服务 Chroma、BM25 映射、引用与删除。 |
+| `doc_id` | 所属文档版本 ID | 首版必须保留 | 关联当前物理文档版本。 |
+| `logical_doc_id` | 所属逻辑文档 ID | 首版必须保留 | 支持版本级批量操作与教学对比。 |
+| `collection_name` | 所属集合 | 首版必须保留 | 冗余字段，但能明显降低 BM25 全量重建、Dashboard 过滤、局部删除的 join 成本。 |
+| `chunk_index` | 文档内顺序号 | 首版必须保留 | 用于还原顺序、拼接局部上下文窗口。 |
+| `parent_section_id` | 父 section ID | 首版建议保留 | 为后续 parent-child retrieval 预留。 |
+| `section_path` | section 层级路径 | 首版建议保留 | 便于章节级聚合与调试。 |
+| `title_path_json` | 标题路径 | 首版必须保留 | 是语义分块和引用展示的核心元数据。 |
+| `page_start` | 起始页 | 首版必须保留 | 用于定位和引用。 |
+| `page_end` | 结束页 | 首版必须保留 | 用于定位和引用。 |
+| `raw_text` | 原始块文本 | 首版必须保留 | 直接反映解析后块级内容，是 debug 基线。 |
+| `normalized_text` | 规范化文本 | 首版必须保留 | 是结构清洗后的稳定文本。 |
+| `enriched_text` | 增强文本 | 首版必须保留 | retrieval-oriented enrichment 的结果；失败时允许为空并回退到 `normalized_text`。 |
+| `sparse_text` | 稀疏检索文本 | 首版必须保留 | 服务 BM25，可包含原文、标题、关键词。 |
+| `dense_text` | 稠密检索文本 | 首版必须保留 | 服务 embedding 检索，可包含增强结果、图片描述和上下文元数据。 |
+| `token_count` | token 数 | 首版必须保留 | 便于控制检索与上下文预算。 |
+| `char_count` | 字符数 | 首版必须保留 | 便于快速统计与调试。 |
+| `content_hash` | chunk 内容哈希 | 首版必须保留 | 为未来 chunk 级 diff 和局部重建预留。 |
+| `chunking_version` | 切分逻辑版本 | 首版必须保留 | `chunk_size`、`overlap`、separator 改变后用于识别脏 chunk。 |
+| `enrichment_version` | 增强逻辑版本 | 首版必须保留 | prompt、局部上下文窗口、元数据注入变化后可用于重建。 |
+| `caption_version` | 图片描述逻辑版本 | 首版建议保留 | 首版可不强依赖，但多模态策略迭代时很有帮助。 |
+| `embedding_provider` | embedding 服务商 | 首版必须保留 | 与向量重建和问题排查直接相关。 |
+| `embedding_model` | embedding 模型名 | 首版必须保留 | 向量状态的基本标识。 |
+| `embedding_model_version` | embedding 模型版本 | 首版必须保留 | 更换模型或维度时可识别旧 chunk。 |
+| `embedding_dimension` | 向量维度 | 首版必须保留 | 有助于迁移和完整性校验。 |
+| `embedding_fingerprint` | 向量状态指纹 | 首版必须保留 | 由 `dense_text + provider + model + model_version + enrichment_version` 组合生成，是识别“静默脏向量”的核心字段。 |
+| `vector_store_provider` | 向量库类型 | 首版建议保留 | 首版默认 Chroma，后续迁移到其他向量库时可复用。 |
+| `vector_store_collection` | 向量库 collection 名称 | 首版建议保留 | 便于删除和重建时定位。 |
+| `bm25_index_version` | 当前归属 BM25 artifact 版本 | 首版建议保留 | 首版不是硬依赖，但对 BM25 一致性调试和教学展示很有帮助。 |
+| `image_count` | 关联图片数 | 首版必须保留 | 多模态展示和分析直接需要。 |
+| `has_image` | 是否含图 | 首版必须保留 | 便于快速筛选和调试。 |
+| `synthetic_image_chunk` | 是否为图片辅助 chunk | 首版建议保留 | 当图片无法自然归属时生成的辅助块标记。 |
+| `is_active` | 是否活跃 | 首版必须保留 | 文档更新采用“旧版本失活 + 新版本插入”。 |
+| `is_deleted` | 是否逻辑删除 | 首版必须保留 | BM25 删除过滤与查询侧一致性依赖。 |
+| `deleted_at` | 删除时间 | 首版必须保留 | 删除审计与阈值重建分析需要。 |
+| `created_at` | 创建时间 | 首版必须保留 | 审计与排序展示。 |
+| `updated_at` | 更新时间 | 首版必须保留 | 状态变化追踪。 |
+
+### 12.11 document_images 表设计
+```sql
+CREATE TABLE document_images (
+  image_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  logical_doc_id TEXT NOT NULL,
+  chunk_id TEXT,
+
+  page_number INTEGER NOT NULL,
+  image_index_on_page INTEGER DEFAULT 0,
+
+  image_path TEXT,
+  image_sha256 TEXT,
+
+  caption_text TEXT,
+  caption_model_provider TEXT,
+  caption_model_name TEXT,
+  caption_model_version TEXT,
+  caption_prompt_version TEXT,
+
+  placement_strategy TEXT NOT NULL,
+  placement_confidence REAL DEFAULT 0.0,
+
+  width INTEGER,
+  height INTEGER,
+
+  is_orphan INTEGER NOT NULL DEFAULT 0,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+
+  FOREIGN KEY(doc_id) REFERENCES documents(doc_id),
+  FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
+);
+```
+
+字段设计说明：
+
+| 字段 | 含义 | 保留级别 | 设计备注 |
+|---|---|---|---|
+| `image_id` | 图片主键 | 首版必须保留 | 图片级追踪与 caption 管理基础。 |
+| `doc_id` | 所属文档版本 ID | 首版必须保留 | 绑定当前文档版本。 |
+| `logical_doc_id` | 所属逻辑文档 ID | 首版必须保留 | 支持版本级图片追踪。 |
+| `chunk_id` | 归属 chunk ID | 首版必须保留 | 入库时就确定归属，避免查询阶段重复猜测。 |
+| `page_number` | 图片页码 | 首版必须保留 | 与页级定位强相关。 |
+| `image_index_on_page` | 页内图片序号 | 首版必须保留 | 同页多图场景需要。 |
+| `image_path` | 图片文件路径 | 首版必须保留 | Dashboard 展示与重处理依赖。 |
+| `image_sha256` | 图片哈希 | 首版必须保留 | 去重与缓存可依赖。 |
+| `caption_text` | 图片描述文本 | 首版必须保留 | 多模态能力核心资产。 |
+| `caption_model_provider` | caption 模型服务商 | 首版必须保留 | 排查 caption 效果问题时需要。 |
+| `caption_model_name` | caption 模型名 | 首版必须保留 | 与 provider 一起构成 caption 来源。 |
+| `caption_model_version` | caption 模型版本 | 首版建议保留 | 首版不强依赖，但后续模型更替时有价值。 |
+| `caption_prompt_version` | caption prompt 版本 | 首版建议保留 | 便于复盘 caption 策略变化。 |
+| `placement_strategy` | 图片归属策略 | 首版必须保留 | 建议枚举：`inline_nearest_text / nearest_heading_block / synthetic_image_chunk`。 |
+| `placement_confidence` | 图片归属置信度 | 扩展保留 | 首版通常没有成熟打分算法，但可预留给未来更智能的归属策略。 |
+| `width` | 图片宽度 | 首版建议保留 | 成本低，后续图片展示和规则调优有用。 |
+| `height` | 图片高度 | 首版建议保留 | 与 `width` 同理。 |
+| `is_orphan` | 是否未自然归属 | 首版必须保留 | 后续生成 `synthetic_image_chunk` 或人工复查时很关键。 |
+| `is_deleted` | 是否逻辑删除 | 首版必须保留 | 与文档删除链路保持一致。 |
+| `deleted_at` | 删除时间 | 首版建议保留 | 有助于删除审计。 |
+| `created_at` | 创建时间 | 首版必须保留 | 审计用途。 |
+| `updated_at` | 更新时间 | 首版必须保留 | 状态变化追踪。 |
+
+### 12.12 ingestion_history 表设计
+```sql
+CREATE TABLE ingestion_history (
+  ingestion_id TEXT PRIMARY KEY,
+
+  logical_doc_id TEXT,
+  doc_id TEXT,
+
+  collection_name TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+
+  trigger_type TEXT NOT NULL,
+  operation_type TEXT NOT NULL,
+
+  status TEXT NOT NULL,
+  error_stage TEXT,
+  error_message TEXT,
+
+  raw_markdown_path TEXT,
+  normalized_markdown_path TEXT,
+  chunk_snapshot_path TEXT,
+  enriched_snapshot_path TEXT,
+
+  page_count INTEGER DEFAULT 0,
+  image_count INTEGER DEFAULT 0,
+  chunk_count INTEGER DEFAULT 0,
+  affected_chunks_count INTEGER DEFAULT 0,
+
+  skipped_by_hash INTEGER NOT NULL DEFAULT 0,
+  skipped_reason TEXT,
+
+  bm25_rebuild_requested INTEGER NOT NULL DEFAULT 0,
+  bm25_rebuild_mode TEXT,
+  bm25_index_version_before TEXT,
+  bm25_index_version_after TEXT,
+
+  trace_id TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  duration_ms INTEGER
+);
+```
+
+字段设计说明：
+
+| 字段 | 含义 | 保留级别 | 设计备注 |
+|---|---|---|---|
+| `ingestion_id` | 摄取任务 ID | 首版必须保留 | 每一次任务的唯一主键，而不是只记录文档最终状态。 |
+| `logical_doc_id` | 逻辑文档 ID | 首版必须保留 | 便于跨版本追踪任务。 |
+| `doc_id` | 物理文档版本 ID | 首版必须保留 | 与当次处理的具体文档绑定。 |
+| `collection_name` | 目标集合 | 首版必须保留 | Dashboard 和重建调度需要。 |
+| `source_path` | 输入文件路径 | 首版必须保留 | 排错和重放任务基础。 |
+| `file_name` | 文件名 | 首版必须保留 | 展示与筛选。 |
+| `sha256` | 文件哈希 | 首版必须保留 | 与幂等跳过直接相关。 |
+| `trigger_type` | 任务触发来源 | 首版必须保留 | 建议枚举：`manual_file / manual_directory / scheduled_sync / reindex / delete`。 |
+| `operation_type` | 任务操作类型 | 首版必须保留 | 建议枚举：`insert / update / delete / rebuild`。 |
+| `status` | 当前任务状态 | 首版必须保留 | 建议枚举：`pending / processing / success / failed / skipped`。 |
+| `error_stage` | 失败阶段 | 首版必须保留 | 建议记录：`hash_check / load_markdown / normalize_markdown / split / caption / enrich / embed / vector_upsert / sqlite_commit / bm25_rebuild`。 |
+| `error_message` | 错误信息 | 首版必须保留 | 失败排查关键字段。 |
+| `raw_markdown_path` | 原始 Markdown 快照路径 | 首版必须保留 | Trace 和教学演示直接需要。 |
+| `normalized_markdown_path` | 规范化 Markdown 路径 | 首版必须保留 | 对比结构清洗效果。 |
+| `chunk_snapshot_path` | chunk 快照路径 | 首版必须保留 | 用于查看切块结果。 |
+| `enriched_snapshot_path` | 增强结果快照路径 | 首版必须保留 | 用于查看 enrichment 效果。 |
+| `page_count` | 处理页数 | 首版必须保留 | 任务统计与异常排查。 |
+| `image_count` | 图片数 | 首版必须保留 | 多模态统计。 |
+| `chunk_count` | 产出 chunk 数 | 首版必须保留 | 描述本次生成了多少碎片。 |
+| `affected_chunks_count` | 实际影响 chunk 数 | 首版必须保留 | 与 `chunk_count` 语义不同，更适合 Dashboard 展示更新/删除任务影响范围。 |
+| `skipped_by_hash` | 是否因哈希跳过 | 首版必须保留 | 增量逻辑透明化关键字段。 |
+| `skipped_reason` | 跳过原因 | 首版必须保留 | 便于向用户解释为什么没有重跑。 |
+| `bm25_rebuild_requested` | 是否请求 BM25 重建 | 首版必须保留 | 记录任务是否影响稀疏索引。 |
+| `bm25_rebuild_mode` | BM25 重建模式 | 首版必须保留 | 建议枚举：`debounced_auto / forced_manual / delete_threshold / full_rebuild`，完整体现“自动防抖 + 强制重建”的调度设计。 |
+| `bm25_index_version_before` | 重建前 BM25 版本 | 首版建议保留 | 对比重建前后状态很有帮助。 |
+| `bm25_index_version_after` | 重建后 BM25 版本 | 首版必须保留 | 审计与 Dashboard 展示可直接使用。 |
+| `trace_id` | 关联 Trace ID | 首版必须保留 | 将任务记录与可观测链路串起来。 |
+| `started_at` | 开始时间 | 首版必须保留 | 审计和任务排序基础。 |
+| `finished_at` | 结束时间 | 首版必须保留 | 计算耗时与状态判定。 |
+| `duration_ms` | 总耗时 | 首版必须保留 | Dashboard 和性能调优直接使用。 |
+
+### 12.13 中间产物存储策略
+1. 下列中间产物必须保留，并以文件形式落盘到 `data/processed/`：
+   - 原始 Markdown
+   - 规范化 Markdown
+   - chunk 快照
+   - enriched chunk 快照
+2. SQLite 只保存这些中间产物的路径引用，不直接保存大段文本快照。
+3. 建议目录结构：
+
+```text
+data/processed/
+  documents/{doc_id}/raw.md
+  documents/{doc_id}/normalized.md
+  documents/{doc_id}/chunks.jsonl
+  documents/{doc_id}/enriched_chunks.jsonl
+  bm25/
+    bm25_active.pkl
+    bm25_building.pkl
+    bm25_meta.json
+```
+
+### 12.14 文档更新与删除语义
+1. 文档更新采用“旧版本失活 + 新版本插入”的版本演进语义，而不是原地覆盖。
+2. 当新版本插入成功后：
+   - 旧 `documents.is_active = 0`
+   - 旧 `chunks.is_deleted = 1`
+   - 新版本写入新的 `doc_id` 和新的 chunk 集合
+3. 文档删除采用“软删除 + 外部索引物理删除”的组合语义：
+   - SQLite 中 `documents / chunks / document_images` 做软删除
+   - Chroma 中对应向量物理删除
+   - BM25 查询侧先过滤软删除项，再由异步重建修复索引状态
+4. `trace` 与 `ingestion_history` 在删除场景中逻辑保留，不物理删除。
+
 ## 13. Retrieval Pipeline
 ### 13.1 查询主链路
 `Query Normalize -> Memory Recall -> Dense Retrieve -> BM25 Retrieve -> RRF Fusion -> Rerank -> Context Build -> Answer Generate`
