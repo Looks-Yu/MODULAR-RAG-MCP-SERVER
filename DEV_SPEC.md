@@ -499,6 +499,18 @@ retrieval:
   allow_degraded_search: true
   enable_parallel_recall: true
 
+query_service:
+  strict_citation_mode: false
+  weak_refusal_enabled: true
+  max_answer_tokens: 1024
+  citation_validation_enabled: true
+  fallback_on_generation_error: false
+  memory_token_ratio: 0.2
+  answer_modes:
+    - default
+    - strict_citation
+    - concise
+
 evaluation:
   provider: ragas
   dataset_dir: ./data/eval
@@ -2083,6 +2095,7 @@ class QueryServiceResponse(BaseModel):
     answer: str
     answer_status: str
     retrieval_status: str
+    error_code: str | None = None
     citations: list[dict[str, Any]]
     used_memory: dict[str, Any] | None = None
     used_chunk_ids: list[str]
@@ -2099,12 +2112,17 @@ class QueryServiceResponse(BaseModel):
    - `failed`
 2. `retrieval_status` 直接透传 Retrieval 层的结构化状态，避免查询层吞掉底层退化信息。
 3. `used_memory` 与 `used_chunk_ids` 是教学、调试、Dashboard 和坏案例分析的重要数据。
+4. `error_code` 用于表达更细粒度的失败原因，建议首版至少支持：
+   - `ERR_RETRIEVAL`
+   - `ERR_GEN`
+   - `ERR_BUDGET`
+   - `ERR_CITATION`
 
 ### 41.4 异步执行模型
 1. `QueryService` 首版必须采用 async 主链路。
 2. 原因：
-   - LLM API 通常需要秒级到十秒级等待。
-   - 若不用 async，MCP Server 会在等待期间阻塞，影响其他请求、心跳与整体交互体验。
+   - LLM API 通常需要秒级到 `10s+` 的等待。
+   - 若不用 async，MCP Server 会在等待期间阻塞，影响其他请求、心跳与整体交互体验，严重时会表现为“整个本地智能助手卡死”。
 3. 推荐执行模型：
 
 ```python
@@ -2121,8 +2139,10 @@ memory_result, retrieval_result = await asyncio.gather(memory_task, retrieval_ta
    - 明确说明知识库中未检索到足够相关内容。
    - 不编造确定性结论。
    - 可提示用户换问法、补充上下文或确认文档是否已导入。
+   - 若 Retrieval 层提供 `matched_terms`，可通过 `{suggested_keywords}` 模板变量提示用户“我没有找到 A，但找到了更接近 B 的内容，是否改问 B？”。
 3. Retrieval 完全失败时，不允许仅依赖 memory 直接回答知识型问题；memory 只能辅助理解上下文，不能越权替代知识证据。
 4. 若 Retrieval 成功但 citations 构建失败，可返回 `degraded_answered`，但必须显式标记状态。
+5. 首版建议将弱拒答文案模板化，避免模型在“证据不足”场景下自由发挥。
 
 ### 41.6 Prompt 结构
 首版固定采用四段式 Prompt：
@@ -2137,11 +2157,18 @@ memory_result, retrieval_result = await asyncio.gather(memory_task, retrieval_ta
 3. 输出时尽量附引用编号。
 4. 若检索内容与记忆冲突，以检索内容为准。
 5. 不允许把 memory 当作高于知识库证据的事实来源。
+6. 若输出引用编号，则编号必须来自当前 `Retrieved Knowledge` 中已注入的合法 `doc_ref_id` 锚点。
 
 ### 41.7 Memory 注入策略
 1. 首版只注入 `conversation summary`。
 2. `relevant long-term memory bullets` 作为 V2 能力，在长期记忆向量检索成熟后接入。
 3. memory 在 Prompt 中只作为辅助上下文，不参与事实优先级竞争。
+4. short-term memory 写回时，至少记录：
+   - 用户 query
+   - 最终 answer
+   - `answer_status`
+   - `trace_id`
+5. 将 `trace_id` 写入 short-term memory 的原因，是为了在后续对话出现问题时，能从记忆中快速回溯到上一轮完整检索现场。
 
 ### 41.8 Citation 与引用锚点设计
 1. Context Build 时，必须为每个注入的检索块生成唯一 `doc_ref_id`。
@@ -2154,6 +2181,21 @@ memory_result, retrieval_result = await asyncio.gather(memory_task, retrieval_ta
    - `title_path`
    - `page_range`
 4. 主响应中只返回最终实际使用到的 citations；完整候选集保留在 trace 中。
+5. LLM 生成完成后，QueryService 必须执行一次 `citation anchor validation`：
+   - 若答案中引用了不存在的编号，则移除非法引用并标记 `degraded_answered` 或触发一次轻量后处理修正。
+   - 若答案未输出任何引用，但系统要求严格引用模式，则进入弱回答或拒答分支。
+6. 首版默认采用“规则修补优先”而不是“二次 LLM 修复优先”，避免为引用校验再引入一次高成本生成调用。
+
+### 41.8.1 answer_mode 首版定义
+1. `default`
+   - 普通参考回答模式
+   - 在证据充足时正常作答，在证据不足时进入弱拒答
+2. `strict_citation`
+   - 在 `Answer Policy` 中额外加入“每一句结论必须有引用，无引用则不输出”
+   - 若 citation validation 失败，则优先进入 `weak_answered` 或 `refused`
+3. `concise`
+   - 限制 `max_answer_tokens`
+   - 在 `Answer Policy` 中加入“禁止口水话，直接给结论”
 
 ### 41.9 Query Trace 分阶段事件
 首版 Query Trace 至少记录以下 stage：
@@ -2164,6 +2206,20 @@ memory_result, retrieval_result = await asyncio.gather(memory_task, retrieval_ta
 5. `answer_generated`
 6. `citations_built`
 7. `memory_appended`
+
+### 41.9.1 QueryService 配置建议
+建议在 `settings.yaml` 中增加 `query_service` 配置区，至少包括：
+1. `strict_citation_mode`
+2. `weak_refusal_enabled`
+3. `max_answer_tokens`
+4. `citation_validation_enabled`
+5. `fallback_on_generation_error`
+6. `memory_token_ratio`
+
+说明：
+1. `memory_token_ratio` 用于控制 memory 占总上下文预算的比例，例如 `0.2` 表示记忆默认占总预算的 20%。
+2. 将该比例配置化的意义是，后续可以直接实验“长记忆 vs 多知识块”的平衡，而无需修改代码逻辑。
+3. `fallback_on_generation_error` 首版建议默认关闭，避免生成失败后返回误导性伪答案。
 
 ### 41.10 模块详解：QueryService
 #### 41.10.1 架构设计亮点
