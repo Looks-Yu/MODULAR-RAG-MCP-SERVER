@@ -304,6 +304,7 @@ class Chunk(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     collection: str
+    collection_ids: list[str] | None = None
     top_k_retrieval: int = 20
     top_k_rerank: int = 8
     use_llm_rerank: bool = False
@@ -463,6 +464,10 @@ reranker:
   provider: cross_encoder
   model: BAAI/bge-reranker-base
   llm_fallback_provider: openai
+  score_threshold: 0.35
+  max_seq_length: 512
+  rerank_text_max_chars: 2000
+  rerank_context_preview_chars: 200
 
 vector_store:
   provider: chroma
@@ -484,6 +489,15 @@ memory:
   summary_trigger_turns: 10
   sqlite_path: ./data/sqlite/memory.db
   vector_collection: user_memory
+  context_budget_tokens: 512
+
+retrieval:
+  dense_top_k_multiplier: 3
+  rrf_k: 60
+  retrieval_budget_tokens: 2048
+  enable_multi_collection_interface: true
+  allow_degraded_search: true
+  enable_parallel_recall: true
 
 evaluation:
   provider: ragas
@@ -969,18 +983,28 @@ data/processed/
 
 ### 13.2 详细步骤
 1. 查询标准化：去空白、统一大小写、保留原始 query。
-2. Memory 检索：若有 `conversation_id/user_id`，先召回短期摘要和长期记忆。
-3. Dense 检索：向量检索获取 `top_k_retrieval`。
-4. Sparse 检索：BM25 初始获取比目标更大的候选集，默认 `top_k_retrieval * search_prefetch_multiplier`，然后过滤软删除项与无效项。
-5. RRF 融合：使用统一 chunk_id 去重融合。
-6. 精排：
-   - 默认 Cross-Encoder 重排。
-   - 配置开启时可使用 LLM Rerank。
-7. Top-K 截断：保留前 `top_k_rerank`。
-8. 上下文组装：拼接 chunk 文本、标题路径、图片描述、记忆摘要。
-9. 答案生成：LLM 根据上下文与约束 prompt 作答。
-10. 输出引用：返回 chunk 来源、页码、文档名。
-11. 写入 Query Trace 与会话短期记忆。
+2. 检索边界：首版实际执行仅在单 `collection_name` 内检索，但接口层预留 `collection_ids: list[str]`，为“个人库 + 公共库”等多集合检索场景留接口。
+3. Memory 处理：首版不做 query rewrite，不让 memory 参与召回阶段；memory 仅在 Context Build 阶段以 `Memory-Augmented Context` 方式注入。
+4. 并行召回：Dense 与 Sparse 检索必须通过 `asyncio.gather()` 并行启动，避免串行等待导致 TTFT 近似翻倍。
+5. Dense 检索：向量检索默认获取 `max(top_k_retrieval, top_k_rerank * dense_top_k_multiplier)` 个候选，仅检索当前 collection 内 `is_deleted = 0` 且 `is_active = 1` 的 chunk。
+6. Sparse 检索：BM25 初始获取比目标更大的候选集，默认 `top_k_retrieval * search_prefetch_multiplier`，然后过滤软删除项与无效项。
+7. RRF 融合：使用统一 chunk_id 去重融合，并保留每个候选的召回来源、各自 rank、原始分数与融合分数。
+8. 融合统计：计算 `fused_overlap_count`，记录有多少 chunk 同时被 Dense 和 Sparse 命中，用于衡量双路一致性。
+9. 精排：
+   - 默认使用 `BGE-Reranker` 或同类开源 Cross-Encoder。
+   - 配置开启时可使用 LLM Rerank，但它始终是高成本实验路径或高价值查询开关，而非默认路径。
+   - Rerank 输入不直接传散装 metadata，而是由 Retrieval 层构造统一 `rerank_text`。
+10. 阈值判断：
+   - 记录 `rerank_top_score`。
+   - 基于绝对 `score_threshold` 产出 `rerank_threshold_passed`。
+   - 若阈值未通过，RetrievalService 只标记“相关性不足”，最终是否拒答由 QueryService 决定。
+11. Top-K 截断：保留前 `top_k_rerank` 候选，并以结构化结果返回。
+12. Context Build：在 QueryService 中按“两段式 Token Budget”组装上下文：
+   - `memory_budget_tokens`
+   - `retrieval_budget_tokens`
+13. 答案生成：LLM 根据上下文与约束 prompt 作答。
+14. 输出引用：返回 chunk 来源、页码、文档名。
+15. 写入 Query Trace 与会话短期记忆。
 
 ### 13.3 RRF
 ```python
@@ -995,18 +1019,175 @@ def rrf_fuse(rank_lists: list[list[str]], k: int = 60) -> dict[str, float]:
 ### 13.4 精排策略
 1. Cross-Encoder 适合作为默认精排，成本更稳定。
 2. LLM Rerank 仅用于高价值查询或实验开关。
-3. 重排输入必须包含 `query + chunk dense_text`，不得只看裸文本。
+3. 重排输入必须包含 `query + rerank_text`，不得只看裸文本。
+4. `rerank_text` 以 `enriched_text` 为主，并拼接标题路径、页码范围、图片描述摘要等信息，保证 Cross-Encoder 能感知结构上下文。
+5. 若 `enriched_text` 过长，必须在 Retrieval 层做预截断，必要时附带邻接内容预览，避免超过 reranker 的 `max_seq_length`。
+6. 若 Cross-Encoder 失败，则自动降级到 fused 排序；若 LLM Rerank 失败，则自动回退到 Cross-Encoder，再失败则回退 fused 排序。
 
 ### 13.5 设计说明
 Hybrid Retrieval 解决关键词匹配与语义召回互补问题，RRF 保证融合算法简单可解释，Rerank 负责把候选集合提升到可生成答案的精度。
 
+### 13.6 Retrieval 职责边界
+1. `RetrievalService` 只负责：
+   - Dense recall
+   - Sparse recall
+   - RRF fusion
+   - Rerank
+   - 结构化返回候选、中间分数、降级状态和质量判断
+2. `QueryService` 负责：
+   - Memory-Augmented Context 组装
+   - Token budget 截断
+   - 最终回答/拒答策略
+   - LLM 生成与引用输出
+3. 这种拆分的意义是保证“检索质量判断”和“最终回答策略判断”分层明确，便于调试、评估与单元测试。
+
+### 13.7 Retrieval 输出结构
+```python
+class RetrievedCandidate(BaseModel):
+    chunk_id: str
+    collection_name: str
+    source_type: str  # dense / sparse
+    raw_score: float
+    rank: int
+    chunk: Chunk
+    matched_terms: list[str] | None = None
+
+
+class FusedCandidate(BaseModel):
+    chunk_id: str
+    collection_name: str
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+    dense_score: float | None = None
+    sparse_score: float | None = None
+    rrf_score: float
+    sources: list[str]
+    chunk: Chunk
+
+
+class RerankedCandidate(BaseModel):
+    chunk_id: str
+    collection_name: str
+    rerank_score: float
+    rrf_score: float
+    rerank_text: str
+    chunk: Chunk
+
+
+class RetrievalResult(BaseModel):
+    query: str
+    collection_name: str
+    collection_ids: list[str]
+
+    retrieval_status: str
+    status_reason: str | None = None
+    degraded_from: list[str]
+    applied_pre_filters: list[str] = []
+    applied_post_filters: list[str] = []
+
+    dense_available: bool
+    sparse_available: bool
+
+    dense_candidates: list[RetrievedCandidate]
+    sparse_candidates: list[RetrievedCandidate]
+    fused_candidates: list[FusedCandidate]
+    reranked_candidates: list[RerankedCandidate]
+
+    fused_overlap_count: int
+    rerank_top_score: float | None = None
+    rerank_threshold_passed: bool = False
+
+    selected_candidates: list[RerankedCandidate]
+    trace_id: str
+```
+
+说明：
+1. `retrieval_status` 同时表达“系统执行状态”和“结果质量判断”，建议枚举：
+   - `success`
+   - `dense_only`
+   - `sparse_only`
+   - `hybrid_without_rerank`
+   - `no_relevant_result`
+   - `index_not_ready`
+   - `failed`
+2. `dense_available / sparse_available` 用于显式表达索引可用性，便于 Dashboard、故障定位和后台自愈调度。
+3. `matched_terms` 首版暂不强求，但建议在结构上预留。
+4. `fused_overlap_count` 用于衡量双路检索一致性。若长期接近 0，说明稀疏检索与稠密检索在“各说各话”，需要回头检查分词策略、chunk 质量或 embedding 模型。
+5. `applied_pre_filters / applied_post_filters` 用于记录本次查询实际命中的前置和后置过滤规则，便于 bad case 复盘与 Dashboard 调试。
+
+### 13.8 rerank_text 构造策略
+1. `rerank_text` 必须由 Retrieval 层统一构造，而不是把 metadata 散装传入 reranker。
+2. 推荐模板：
+
+```text
+[Document]
+File: {file_name}
+Titles: {title_path}
+Pages: {page_start}-{page_end}
+
+[Content]
+{enriched_text_truncated}
+
+[Context Preview]
+Prev: {prev_preview}
+Next: {next_preview}
+
+[Image Notes]
+{image_caption_summary}
+```
+
+3. 构造原则：
+   - 正文以 `enriched_text` 为中心，因为它已经补足了主语、省略和局部上下文，更适合 Cross-Encoder。
+   - 若 `enriched_text` 过长，先按 `rerank_text_max_chars` 做预截断。
+   - 可附带邻接 chunk 的前后预览 `context_window preview`，但不应喧宾夺主。
+   - 图片描述只作为辅助信号，不应压过正文内容。
+
+### 13.9 分数阈值与拒答协作
+1. RetrievalService 负责基于绝对 `score_threshold` 产出：
+   - `rerank_top_score`
+   - `rerank_threshold_passed`
+2. QueryService 负责根据这些信号，结合 Memory、Prompt Policy 与回答策略，决定：
+   - 正常回答
+   - 弱回答（说明证据不足）
+   - 明确拒答（如“未检索到足够相关知识”）
+3. 该分层可以避免检索模块越权直接决定最终文案，但又能让检索质量判断结构化沉淀。
+
+### 13.10 Token Budget 截断策略
+1. Context 组装必须采用“两段式 Token Budget”：
+   - `memory_budget_tokens`
+   - `retrieval_budget_tokens`
+2. 截断基于最终 context block 的 token 数，而不是单独的 `dense_text` token 数。
+3. 优先级策略：
+   - 先保留 memory 摘要预算
+   - 再按 rerank 顺序累加检索块
+   - 一旦超过预算，后续 chunk 直接舍弃
+4. 首版不做 chunk 内部再切割，保持逻辑简单、行为可解释。
+
+### 13.11 降级与自愈策略
+1. 整体语义：优先 Hybrid，逐层降级，查询不中断。
+2. 允许的降级路径：
+   - Dense 失败 -> 退化为 Sparse Only
+   - Sparse 失败 -> 退化为 Dense Only
+   - Rerank 失败 -> 退化为 Fused 排序
+3. 若 `sparse_available = False`，系统应在后台自动尝试 BM25 artifact 重载或重建，而不是长期维持不可用状态。
+4. 若 `dense_available = False`，应记录 collection 缺失、向量未建或 Chroma 异常的原因，并继续尝试单路稀疏检索。
+5. 降级状态必须通过 `retrieval_status` 和 `status_reason` 返回，而不能只写日志。
+
+### 13.12 过滤策略总则
+1. 过滤原则：先解析、能前置则前置、无法前置则后置兜底。
+2. 若底层索引支持且属于硬约束（Hard Filter），则在 Dense / Sparse 检索阶段做 Pre-filter，以缩小候选集、降低成本。
+3. 无法前置的过滤（索引不支持、字段缺失或字段质量不稳定）在 Rerank 前统一做 Post-filter，作为 safety net。
+4. 对缺失字段默认采取 `missing -> include` 的宽松策略，避免过早误杀召回。
+5. 软偏好（Soft Preference，例如“更近期更好”“更高质量文档优先”）不做硬过滤，而应作为排序信号在融合或重排阶段加权。
+6. 该策略的目标是：保证召回尽可能全，同时把错误和脏数据挡在最终答案之前。
+
 ## 14. Context 构建策略
 上下文由四部分组成：
 
-1. 检索片段正文。
-2. 元数据：文档名、标题路径、页码范围、chunk 序号。
-3. 图片描述：作为正文附加段落插入。
-4. 记忆内容：短期对话摘要、长期偏好记忆、任务回顾记忆。
+1. 记忆内容：短期对话摘要、长期偏好记忆、任务回顾记忆。
+2. 检索片段正文。
+3. 元数据：文档名、标题路径、页码范围、chunk 序号。
+4. 图片描述：作为正文附加段落插入。
 
 上下文模板：
 ```text
@@ -1014,6 +1195,7 @@ Hybrid Retrieval 解决关键词匹配与语义召回互补问题，RRF 保证�
 {memory_summary}
 
 [Retrieved Context 1]
+[1] {doc_ref_id}
 Source: {file_name} | Titles: {title_path} | Pages: {page_range}
 Text: {dense_text}
 Image Notes: {image_captions}
@@ -1025,7 +1207,10 @@ Image Notes: {image_captions}
 规则：
 1. 上下文构建必须保留来源信息，便于引用。
 2. 图像描述默认和所属 chunk 同级拼接，不单独建独立回答上下文。
-3. 超长上下文必须按分数截断，禁止无上限堆叠。
+3. 首版采用 `Memory-Augmented Context`：`Memory Summary + Retrieved Chunks`，不让 memory 改写 query。
+4. 超长上下文必须按 token budget 截断，禁止无上限堆叠，也不使用固定 chunk 条数。
+5. Context Build 阶段必须为每个注入的 chunk 生成唯一 `doc_ref_id`，并在 Retrieved Knowledge 中以 `[1]`, `[2]` 这类编号块形式展示，便于 LLM 学习并输出稳定引用。
+6. 首版 Memory 注入只实现 `conversation summary`；`relevant long-term memory bullets` 作为 V2 扩展，在长期记忆向量检索能力成熟后再接入。
 
 ## 15. 多模态处理
 ### 15.1 处理策略
@@ -1642,18 +1827,21 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 2. RRF 作为融合层，兼具实现简单和面试可解释性。
 3. Rerank 作为精排层，使检索链路具备“粗排召回 + 精排过滤”的工业形态。
 4. Context Builder 将 metadata、图片描述、memory 统一纳入上下文编排。
+5. Retrieval 输出结构化中间结果与降级状态，而不是只返回最终 chunks，便于 Dashboard、评估和坏案例分析。
 
 ### 35.3 关键技术难点
 1. Query 与文档语义空间不一致时，Dense Retrieval 也可能失效。
 2. BM25 和 Dense 分数不可直接比较，因此需要融合层。
 3. Rerank 提升精度的同时也引入额外成本。
 4. Context 构建不只是“拼字符串”，而是信息压缩与冲突控制问题。
+5. 当精排最高分也很低时，系统必须有能力“拒绝胡答”，而不是继续把低质量上下文喂给生成模型。
 
 ### 35.4 扩展方向与建议
 1. 增加 query rewrite、self-query、multi-query retrieval。
 2. 增加更细粒度 rerank 策略与预算控制。
 3. 支持 chunk window 扩展与 parent-child retrieval。
 4. 支持基于用户画像或记忆的 personalized retrieval。
+5. 基于 `rerank_top_score` 和坏案例统计，进一步推导相对阈值与自适应拒答策略。
 
 ### 35.5 知识点清单
 1. BM25 原理
@@ -1675,9 +1863,15 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 4. 检索做好了为什么还会答错？  
 参考回答：因为 RAG 是“检索 + 上下文构建 + 生成”的系统，检索正确不代表上下文拼装和生成一定正确。
 
+5. 为什么 RetrievalResult 要保留中间态而不是只返回最终 Top-K？  
+参考回答：因为真实工程里需要解释“为什么命中了这些结果”“为什么退化成单路检索”“为什么拒答”，中间态是可观测性、Dashboard、评估和坏案例分析的基础。
+
+6. 为什么要做 `score threshold`？  
+参考回答：因为不是所有检索结果都值得交给生成模型。如果 rerank 最高分都很低，说明检索到的上下文相关性不足，此时继续生成只会放大幻觉风险。
+
 ### 35.7 简历撰写建议
 可写为：
-“构建 Hybrid Retrieval 检索链路，结合 BM25、Dense Embedding、RRF 融合与 Cross-Encoder/LLM Rerank，实现粗排召回与精排过滤两阶段架构，并设计上下文构建模块提升回答可解释性。”
+“构建 Hybrid Retrieval 检索链路，结合 BM25、Dense Embedding、RRF 融合与 Cross-Encoder/LLM Rerank，实现粗排召回与精排过滤两阶段架构；设计结构化 RetrievalResult、分数阈值拒答机制与 Memory-Augmented Context，提升系统可解释性、稳定性与坏案例分析能力。”
 
 ## 36. 模块详解：Memory System
 ### 36.1 模块目标
@@ -1856,3 +2050,160 @@ MCP 和 Agent 都依赖工具调用，统一抽象能降低未来扩展成本。
 2. 高频面试题与参考回答
 3. 简历撰写建议
 4. 模块扩展路线图
+
+## 41. QueryService 设计
+### 41.1 模块目标
+`QueryService` 是问答主控层，负责把用户问题、检索结果、记忆上下文和回答策略整合为最终可返回的结构化响应。它不是“简单拼 prompt 再调用 LLM”，而是整个问答链路的决策中心。
+
+### 41.2 职责边界
+1. 接收 MCP 层查询请求并做参数归一化。
+2. 并行触发 `RetrievalService` 和 Memory 读取。
+3. 根据 Retrieval 结果与质量阈值，决定正常回答、弱回答、拒答或降级回答。
+4. 基于 `Memory-Augmented Context` 组装最终 prompt。
+5. 调用 LLM 生成答案，并构建 citations。
+6. 记录 Query Trace，并追加 short-term memory。
+7. `QueryService` 不负责底层召回、RRF、Rerank 实现细节，这些属于 `RetrievalService`。
+
+### 41.3 QueryService 输入输出
+```python
+class QueryServiceRequest(BaseModel):
+    query: str
+    collection_name: str
+    collection_ids: list[str] | None = None
+    conversation_id: str | None = None
+    user_id: str | None = None
+    top_k_retrieval: int = 20
+    top_k_rerank: int = 8
+    use_llm_rerank: bool = False
+    answer_mode: str = "default"
+    allow_fallback_answer: bool = True
+
+
+class QueryServiceResponse(BaseModel):
+    answer: str
+    answer_status: str
+    retrieval_status: str
+    citations: list[dict[str, Any]]
+    used_memory: dict[str, Any] | None = None
+    used_chunk_ids: list[str]
+    refusal_reason: str | None = None
+    trace_id: str
+```
+
+说明：
+1. `answer_status` 建议枚举：
+   - `answered`
+   - `weak_answered`
+   - `refused`
+   - `degraded_answered`
+   - `failed`
+2. `retrieval_status` 直接透传 Retrieval 层的结构化状态，避免查询层吞掉底层退化信息。
+3. `used_memory` 与 `used_chunk_ids` 是教学、调试、Dashboard 和坏案例分析的重要数据。
+
+### 41.4 异步执行模型
+1. `QueryService` 首版必须采用 async 主链路。
+2. 原因：
+   - LLM API 通常需要秒级到十秒级等待。
+   - 若不用 async，MCP Server 会在等待期间阻塞，影响其他请求、心跳与整体交互体验。
+3. 推荐执行模型：
+
+```python
+memory_task = load_memory_summary(...)
+retrieval_task = retrieval_service.retrieve(...)
+memory_result, retrieval_result = await asyncio.gather(memory_task, retrieval_task)
+```
+
+4. Memory 与 Retrieval 可以并行，因为首版 memory 不参与 query rewrite，不构成前置依赖。
+
+### 41.5 回答策略与拒答语义
+1. 当 `rerank_threshold_passed = True` 时，默认正常回答。
+2. 当 `rerank_threshold_passed = False` 时，首版采用“弱拒答”策略：
+   - 明确说明知识库中未检索到足够相关内容。
+   - 不编造确定性结论。
+   - 可提示用户换问法、补充上下文或确认文档是否已导入。
+3. Retrieval 完全失败时，不允许仅依赖 memory 直接回答知识型问题；memory 只能辅助理解上下文，不能越权替代知识证据。
+4. 若 Retrieval 成功但 citations 构建失败，可返回 `degraded_answered`，但必须显式标记状态。
+
+### 41.6 Prompt 结构
+首版固定采用四段式 Prompt：
+1. `System Instruction`
+2. `Answer Policy`
+3. `Memory Context`
+4. `Retrieved Knowledge`
+
+其中 `Answer Policy` 必须显式包含以下约束：
+1. 优先基于检索到的知识片段回答。
+2. 若检索证据不足，应明确说明“不确定”或“未找到足够相关知识”。
+3. 输出时尽量附引用编号。
+4. 若检索内容与记忆冲突，以检索内容为准。
+5. 不允许把 memory 当作高于知识库证据的事实来源。
+
+### 41.7 Memory 注入策略
+1. 首版只注入 `conversation summary`。
+2. `relevant long-term memory bullets` 作为 V2 能力，在长期记忆向量检索成熟后接入。
+3. memory 在 Prompt 中只作为辅助上下文，不参与事实优先级竞争。
+
+### 41.8 Citation 与引用锚点设计
+1. Context Build 时，必须为每个注入的检索块生成唯一 `doc_ref_id`。
+2. 在 `Retrieved Knowledge` 中按 `[1]`, `[2]` 形式组织 block，帮助 LLM 学习稳定的引用格式。
+3. Citation 最终至少返回：
+   - `doc_ref_id`
+   - `doc_id`
+   - `chunk_id`
+   - `file_name`
+   - `title_path`
+   - `page_range`
+4. 主响应中只返回最终实际使用到的 citations；完整候选集保留在 trace 中。
+
+### 41.9 Query Trace 分阶段事件
+首版 Query Trace 至少记录以下 stage：
+1. `request_received`
+2. `memory_loaded`
+3. `retrieval_completed`
+4. `context_built`
+5. `answer_generated`
+6. `citations_built`
+7. `memory_appended`
+
+### 41.10 模块详解：QueryService
+#### 41.10.1 架构设计亮点
+1. 将“检索质量判断”和“最终回答策略判断”显式分层。
+2. 采用 async 主链路，避免 MCP Server 因等待 LLM 而整体阻塞。
+3. 通过 `answer_status + retrieval_status + refusal_reason` 提升可观测性。
+4. 通过编号式引用锚点，提升模型输出引用的稳定性和一致性。
+
+#### 41.10.2 关键技术难点
+1. 如何在检索不充分时拒绝胡答，而不是继续生成幻觉。
+2. 如何在 memory 存在的情况下，仍保持知识库证据优先。
+3. 如何在 token budget 下同时兼顾 memory、检索内容和引用完整性。
+4. 如何在生成失败或 citation 失败时做优雅降级。
+
+#### 41.10.3 扩展方向与建议
+1. 增加 long-term memory bullets 注入。
+2. 增加 answer mode，如严格引用模式、只基于知识库模式、简洁回答模式。
+3. 增加基于 bad case 的自适应拒答策略。
+4. 增加 streaming answer 与渐进式 citation 输出。
+
+#### 41.10.4 知识点清单
+1. Prompt 分层设计
+2. Retrieval-Augmented Answering 与拒答策略
+3. Token Budget 与上下文装配
+4. 引用对齐与 citation grounding
+5. 异步服务设计与非阻塞 I/O
+
+#### 41.10.5 高频面试题
+1. 为什么 QueryService 不能只是“拿结果拼 prompt”？  
+参考回答：因为它还要负责回答策略、拒答逻辑、记忆注入、引用锚点和可观测状态的统一编排，是整个问答系统的控制层。
+
+2. 为什么 memory 与知识检索冲突时，以检索内容为准？  
+参考回答：因为 memory 更像历史上下文和用户偏好，而知识库检索结果才是当前问题的事实证据来源。
+
+3. 为什么要做 async QueryService？  
+参考回答：因为 LLM 调用通常是整个链路中最慢的环节，如果主链路是同步阻塞的，MCP Server 的并发体验和稳定性都会明显下降。
+
+4. 为什么要用 `[1] [2]` 这种引用块格式？  
+参考回答：因为它能帮助模型建立稳定的“证据块 -> 输出引用”映射，提升 citation 一致性与可解释性。
+
+#### 41.10.6 简历撰写建议
+可写为：
+“设计异步 QueryService 作为 RAG 问答主控层，统一编排检索结果、对话记忆、Token Budget 与引用锚点机制；通过弱拒答策略、证据优先回答和结构化状态输出，提升系统稳定性与可解释性。”
