@@ -437,6 +437,245 @@ class ProviderFactory:
 2. 服务层只能依赖抽象接口。
 3. 工厂选择 provider 的唯一依据是 `settings.yaml`。
 
+### 10.1 可插拔架构总体原则
+本项目的可插拔架构目标是：定义清晰的抽象层与接口契约，使 RAG 链路的每个核心组件都能够独立替换与升级，避免技术锁定，并支持低成本 A/B 测试与环境迁移。
+
+设计原则：
+1. 配置文件不直接映射 Python 类名，而是通过“逻辑名称 -> driver -> 物理实现”的两层映射避免类重构破坏配置。
+2. 区分两类可插拔单元：
+   - `Provider Plugins`：面向外部后端能力，如 LLM、Embedding、Reranker、VectorStore、MemoryStore、Evaluator。
+   - `Strategy Plugins`：面向内部算法/流程策略，如 Loader、Splitter、ChunkEnricher、RetrievalStrategy、FusionStrategy、ContextBuilder、AnswerPolicy。
+3. 可插拔架构必须支持 capability 驱动，而不是让业务层通过 provider 名称猜能力。
+4. fallback 是架构层正式能力，而不是散落在业务代码中的临时 if/else。
+5. 本地 `stdio` 模式下，架构优先追求可预测、可观察、可调试，而不是复杂动态调度。
+
+### 10.2 轻量三段式：Registry + Resolver + Factory
+本项目采用轻量三段式，而不是重型动态插件系统：
+
+1. `Registry`
+   - 负责维护“逻辑 driver 名称 -> 实现类/构造器”的稳定映射。
+   - 不承载业务逻辑，不负责实例化，不负责运行时复杂决策。
+
+2. `Resolver`
+   - 负责根据静态配置、capability 约束和 fallback 规则选择当前应启用的实例。
+   - 仅做轻量静态选择，不依赖实时网络状态、CPU 负载、内存探测等动态信号。
+
+3. `Factory`
+   - 负责根据 Resolver 选择出的配置实例化具体对象。
+   - 只管“创建”，不管“选择策略”。
+
+设计说明：
+1. 如果只有 Factory，配置会逐渐退化为“硬编码 if/else 选择器”。
+2. 如果 Resolver 过重，会让本地 `stdio` Server 在启动和调试时变得不可预测。
+3. 轻量三段式在“可插拔能力”和“可维护性”之间取得折中，适合当前本地优先的 MCP Server。
+
+### 10.3 Registry 生命周期规范
+Registry 的生命周期必须显式、可预测，不能依赖 import 副作用做隐式全局注册。
+
+#### 10.3.1 生命周期阶段
+1. `Bootstrap Init`
+   - 进程启动时，显式创建：
+     - `ProviderRegistry`
+     - `StrategyRegistry`
+   - 此时 Registry 为空，但对象已存在。
+
+2. `Eager Registration`
+   - 在 Server 正式接受请求前，注册所有内置 drivers 与 strategies。
+   - 例如：
+     - `generic_openai`
+     - `azure_openai`
+     - `ollama`
+     - `chroma`
+     - `recursive_character_splitter`
+     - `default_context_builder`
+   - 该阶段只注册元数据和构造器，不加载重资源。
+
+3. `Config Validation`
+   - 读取 `settings.yaml` 后，校验：
+     - active provider 名称是否存在
+     - fallback provider 是否存在
+     - strategy 名称是否存在
+     - capability 约束是否满足
+   - 若配置引用不存在的 driver，应在启动阶段快速失败。
+
+4. `Freeze Registry`
+   - 启动校验通过后，Registry 进入只读模式。
+   - 请求处理阶段不允许动态增删条目，避免不同请求看到不同插件集合。
+
+5. `Factory / Resolver Bind`
+   - 将冻结后的 Registry 注入 Resolver 和 Factory。
+   - 从此业务层仅通过 Resolver + Factory 获取实例，不直接接触注册细节。
+
+6. `Runtime Read-Only`
+   - 运行时 Registry 只读。
+   - 可以读取 metadata、capabilities、available drivers，但不能热插拔写入。
+
+7. `Shutdown`
+   - Registry 本身不持久化到磁盘。
+   - 它是进程内元数据容器，进程退出即销毁。
+
+#### 10.3.2 生命周期约束
+1. Registry 语义上是“进程级唯一”，但实现上不应写成不可替换的魔法单例。
+2. 推荐采用“显式创建 + 显式注入”的方式，而不是模块级全局变量。
+3. 这样做的好处：
+   - 测试可以创建隔离 Registry
+   - CLI / Dashboard / MCP Server 可以有独立 bootstrap
+   - 避免 import 顺序问题
+   - 避免因隐式副作用导致首次请求卡顿
+
+#### 10.3.3 Eager Loading 与 Lazy Warmup
+Registry 生命周期中必须区分两类初始化：
+
+1. 必须 Eager 的内容：
+   - Registry 对象创建
+   - driver / strategy 注册
+   - 配置合法性校验
+   - capability metadata 校验
+   - active/fallback 名称解析
+
+2. 不应阻塞启动的内容：
+   - Chroma 全量 warmup
+   - BM25 artifact 全量重载完成
+   - 重型本地模型真正加载到显存/内存
+   - 大型 embedding 模型预热
+
+结论：
+1. 采用 `Eager Registration + Lazy Heavy Resource Warmup`。
+2. 也就是：插件元数据必须启动期就绪，重资源实例可以异步或按需预热。
+3. 这样既能避免第一次调用 Tool 时才找插件导致卡顿，又不会因为重资源初始化卡死 `stdio` Server。
+
+### 10.4 Capability 模型
+一级核心可插拔组件必须暴露 capability 描述，而不能只有方法签名。
+
+推荐 capability 结构：
+
+```python
+class ProviderCapabilities(BaseModel):
+    supports_chat: bool = True
+    supports_vision: bool = False
+    supports_async: bool = True
+    supports_streaming: bool = False
+    supports_batch_embed: bool = False
+    supports_metadata_filter: bool = False
+    supports_rerank: bool = False
+    max_context_tokens: int | None = None
+    resource_intensity: Literal["low", "medium", "high"] = "medium"
+```
+
+说明：
+1. `supports_vision`
+   - 用于决定当文档/查询涉及图片时，哪些 LLM 可参与多模态任务。
+2. `supports_metadata_filter`
+   - 让业务层通过能力而不是 provider 名称决定是否执行 pre-filter。
+3. `supports_batch_embed`
+   - 用于 Ingestion 和重建时优化批量向量化路径。
+4. `max_context_tokens`
+   - 不是让 Resolver 在请求时做复杂智能调度，而是作为 ContextBuilder / AnswerPolicy 的预算依据。
+5. `resource_intensity`
+   - 是静态资源标签，而不是动态资源调度器。
+   - 用于约束：
+     - 本地 `stdio` 模式下不启用重型 shadow execution
+     - fallback 时优先选择低/中资源实例
+     - 避免双重型本地模型同时运行导致内存抖动或 OOM
+
+### 10.5 Resolver 约束
+Resolver 必须保持轻量、静态、可预测。
+
+允许的职责：
+1. 根据 active selector 选择主实例。
+2. 基于 capability 过滤不满足条件的候选。
+3. 按静态 fallback 链做降级选择。
+
+不允许的职责：
+1. 根据实时网络状态切换 provider。
+2. 根据 CPU/内存瞬时负载做运行时调度。
+3. 在请求路径中做复杂探测或黑盒决策。
+
+设计说明：
+1. 这样做是为了避免本地 `stdio` Server 启动变慢、调试困难、行为不可预测。
+2. Agent / ReAct 的智能决策应属于 Agent 层，而不是 Provider Resolver。
+
+### 10.6 配置模型升级
+配置模型必须从“直接指定 provider 类型”升级为“命名实例 + active selector”。
+
+推荐结构：
+
+```yaml
+providers:
+  llm:
+    active: primary_llm
+    fallback_chain: [backup_llm]
+    instances:
+      primary_llm:
+        driver: generic_openai
+        model: gpt-4.1-mini
+        base_url: ${OPENAI_BASE_URL}
+        api_key: ${OPENAI_API_KEY}
+      backup_llm:
+        driver: ollama
+        model: qwen2.5:7b
+
+strategies:
+  splitter:
+    active: recursive_default
+    instances:
+      recursive_default:
+        driver: recursive_character_splitter
+        chunk_size: 900
+        chunk_overlap: 180
+```
+
+说明：
+1. `driver` 是 Registry 中的逻辑实现名，不是 Python 类名。
+2. `active` 表示当前生效实例。
+3. `fallback_chain` 明确写成配置，而不是隐藏在代码里。
+
+### 10.7 GenericOpenAIProvider 设计
+为避免 provider class 爆炸，首版必须提供一个 `GenericOpenAIProvider`。
+
+适用场景：
+1. OpenAI 官方兼容接口
+2. DeepSeek 兼容层
+3. OneAPI
+4. 本地 vLLM OpenAI-compatible endpoint
+5. 其他遵循 OpenAI 协议的代理层
+
+设计收益：
+1. 新接一个 OpenAI-compatible 后端时，只需修改 `settings.yaml`，不必新增 Python 类。
+2. 真正实现“低代码插拔”，避免“一家厂商一个 Provider 类”的膨胀式设计。
+
+### 10.8 StrategyRegistry 范围
+下列组件必须纳入 `StrategyRegistry`：
+1. `Loader`
+2. `Splitter`
+3. `ChunkEnricher`
+4. `RetrievalStrategy`
+5. `FusionStrategy`
+6. `ContextBuilder`
+7. `AnswerPolicy`
+
+说明：
+1. Ingestion 的可插拔不应只停留在 Embedding / VectorStore。
+2. `Splitter`、`Enricher`、`ContextBuilder` 等内部策略也必须成为一等公民，否则系统只是在“后端可插拔”，而不是“链路可插拔”。
+
+### 10.9 A/B 测试与 Compare Mode 约束
+首版支持的 A/B 能力：
+1. 配置级切换
+2. 离线 compare mode
+
+首版不支持的能力：
+1. 在 MCP `stdio` 主请求链路中做重型 shadow execution
+2. 并行双本地大模型在线对比
+
+原因：
+1. 在单进程本地模式下，这很容易造成：
+   - stdout 干扰
+   - CPU 抖动
+   - 内存抖动
+   - OOM
+   - TTFT 失控
+2. 因此 `shadow/compare mode` 应写入扩展设计，但默认只用于离线评估脚本或非主请求链路。
+
 ## 11. 配置设计
 ### 11.1 settings.yaml
 ```yaml
@@ -1347,19 +1586,35 @@ class EvaluatorAgent: ...
 {
   "query": "RRF 是什么",
   "collection": "default",
+  "collection_ids": ["default"],
   "top_k_retrieval": 20,
   "top_k_rerank": 8,
   "use_llm_rerank": false,
   "conversation_id": "conv_001",
-  "user_id": "user_001"
+  "user_id": "user_001",
+  "answer_mode": "default",
+  "debug": false
 }
 ```
 输出：
 ```json
 {
-  "answer": "RRF 是一种排序融合算法...",
-  "citations": [{"doc_id":"d1","chunk_id":"c3","page_range":[2,3]}],
-  "trace_id": "trace_xxx"
+  "status": "success",
+  "trace_id": "trace_xxx",
+  "data": {
+    "answer": "RRF 是一种排序融合算法...",
+    "answer_status": "answered",
+    "retrieval_status": "success",
+    "citations": [
+      {
+        "doc_ref_id": "[1]",
+        "doc_id": "d1",
+        "chunk_id": "c3",
+        "page_range": [2, 3]
+      }
+    ]
+  },
+  "error": null
 }
 ```
 
@@ -1367,7 +1622,21 @@ class EvaluatorAgent: ...
 输入：`{}`
 输出：
 ```json
-{"collections": ["default", "finance", "legal"]}
+{
+  "status": "success",
+  "trace_id": "trace_xxx",
+  "data": {
+    "collections": [
+      {
+        "collection_name": "default",
+        "document_count": 120,
+        "chunk_count": 4810,
+        "last_indexed_at": "2026-05-09T10:30:00Z"
+      }
+    ]
+  },
+  "error": null
+}
 ```
 
 #### `get_document_summary`
@@ -1378,10 +1647,15 @@ class EvaluatorAgent: ...
 输出：
 ```json
 {
-  "doc_id": "doc_001",
-  "file_name": "rag_intro.pdf",
-  "summary": "该文档主要介绍...",
-  "chunk_count": 42
+  "status": "success",
+  "trace_id": "trace_xxx",
+  "data": {
+    "doc_id": "doc_001",
+    "file_name": "rag_intro.pdf",
+    "summary": "该文档主要介绍...",
+    "chunk_count": 42
+  },
+  "error": null
 }
 ```
 
@@ -1390,9 +1664,124 @@ class EvaluatorAgent: ...
 
 ### 19.3 实现约束
 1. 仅 `stdio transport`。
-2. Handler 负责 schema 校验和错误包装。
-3. Application Service 负责业务编排。
-4. 所有 tool 调用都必须产出 trace_id。
+2. `MCP Server` 只负责：
+   - Tool 注册
+   - Schema 校验
+   - 请求分发
+   - 错误包装
+   - Trace 注入
+3. Handler 不允许直接拼业务逻辑，必须通过 Application Service 入口调用。
+4. 所有 tool 调用都必须产出 `trace_id`。
+5. 首版只暴露三个 tools：
+   - `query_knowledge_hub`
+   - `list_collections`
+   - `get_document_summary`
+6. `query_knowledge_hub` 返回最终问答结果，而不是半成品检索结果；可通过 `debug=false/true` 决定是否附带轻量调试信息。
+
+### 19.4 MCP 统一响应协议
+所有 MCP tools 必须遵循统一响应外壳：
+
+```json
+{
+  "status": "success|error",
+  "trace_id": "trace_xxx",
+  "data": {},
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "human readable message",
+    "retry_after": 30
+  }
+}
+```
+
+协议说明：
+1. `status` 是协议级状态，而不是业务回答质量状态。
+2. `trace_id` 在成功和失败场景下都必须返回。
+3. `data` 承载 tool 的正常业务结果。
+4. `error` 承载稳定错误码和补充信息。
+5. “弱拒答”属于正常业务结果，不应作为协议级错误返回。
+
+### 19.5 MCP 错误码设计
+首版建议至少定义以下稳定错误码：
+
+| 错误码 | 含义 | 说明 |
+|---|---|---|
+| `MCP_INVALID_INPUT` | 输入不合法 | schema 校验失败、必填字段缺失、字段类型错误 |
+| `MCP_TOOL_EXECUTION_FAILED` | tool 执行失败 | 未知异常的统一兜底 |
+| `QUERY_NO_RELEVANT_RESULT` | 未检索到足够相关知识 | 属于业务结果，可放在 success 响应的 data/status 中，也可用于 error 明示 |
+| `QUERY_RETRIEVAL_FAILED` | 检索层失败 | Dense/Sparse/Rerank 链路异常 |
+| `QUERY_GENERATION_FAILED` | 生成层失败 | LLM 调用失败或生成中断 |
+| `QUERY_BUDGET_EXCEEDED` | 上下文预算超限 | Prompt 无法安全构造 |
+| `SUMMARY_NOT_FOUND` | 文档摘要不存在 | doc_id 不存在或文档未完成索引 |
+| `COLLECTION_NOT_FOUND` | 集合不存在 | collection 查询失败 |
+| `INDEX_NOT_READY` | 索引未就绪 | 适用于启动后异步初始化尚未完成或索引状态异常 |
+
+### 19.6 启动与异步初始化策略
+1. 由于使用 `stdio transport`，MCP Server 启动时不得因 Chroma、BM25 或其他索引初始化而长时间阻塞主进程。
+2. 服务器必须遵循“快速启动、异步初始化、工具先注册”的原则：
+   - 先加载基础 settings
+   - 先完成 ToolRegistry 注册
+   - 主进程尽快进入可响应状态
+   - 索引、向量库状态检查与预加载在后台异步执行
+3. 若客户端在初始化尚未完成前调用 tool：
+   - 服务不得卡住不返回
+   - 应返回稳定的 `INDEX_NOT_READY` 响应
+   - 并通过 `retry_after` 建议客户端稍后重试
+4. 推荐返回示例：
+
+```json
+{
+  "status": "error",
+  "trace_id": "trace_xxx",
+  "data": {},
+  "error": {
+    "code": "INDEX_NOT_READY",
+    "message": "Sparse index is still loading. Please retry later.",
+    "retry_after": 30
+  }
+}
+```
+
+5. 这样设计的原因是：
+   - `stdio` 客户端通常会将“启动长时间无响应”视为服务崩溃
+   - 异步初始化能避免本地助手误判 Server 挂死并强制杀进程
+   - `retry_after` 能给客户端更明确的恢复策略
+6. 若索引未就绪，MCP Server 仍应成功启动：
+   - `query_knowledge_hub` 返回 `INDEX_NOT_READY` 或降级状态
+   - `list_collections` 和 `get_document_summary` 仍可正常工作
+
+### 19.7 ToolRegistry 集成策略
+1. MCP tools 也必须统一注册到 `ToolRegistry`，而不是由 MCP Server 单独维护一套内部列表。
+2. 这样设计的原因是：
+   - 保证 MCP tools 与本地 tools 最终共享统一抽象
+   - 为后续 Agent 直接复用 MCP 能力打基础
+   - 避免协议层和内部 tool 体系分裂
+3. 但 MCP SDK 的 schema 与内部 `BaseTool.run(payload)` 协议不完全等价，因此需要增加一层 `schema adapter`：
+   - MCP Handler 负责把 MCP 请求映射到内部 payload
+   - 内部 Tool 执行后再映射回 MCP 统一响应结构
+
+### 19.8 list_collections 设计要求
+1. `list_collections` 不应只返回名字数组，而应返回摘要化结构。
+2. 首版至少包含：
+   - `collection_name`
+   - `document_count`
+   - `chunk_count`
+   - `last_indexed_at`
+3. 这样设计的原因是：
+   - 更适合 MCP Client 展示
+   - 也更适合 Dashboard、调试与教学演示
+
+### 19.9 query_knowledge_hub 调试模式
+1. `query_knowledge_hub` 首版建议支持 `debug: bool = false`。
+2. `debug = false` 时返回标准业务结果。
+3. `debug = true` 时仅返回轻量调试信息，避免把全量中间态直接暴露给 MCP Client。
+4. 首版建议在 debug 模式附带：
+   - `retrieval_status`
+   - `answer_status`
+   - `used_chunk_ids`
+   - `rerank_top_score`
+   - `citations`
+5. 不建议首版在 debug 模式直接返回全部 dense/sparse/fused candidates，避免响应过重且增加协议复杂度。
 
 ## 20. 可观测性
 ### 20.1 Trace 类型
